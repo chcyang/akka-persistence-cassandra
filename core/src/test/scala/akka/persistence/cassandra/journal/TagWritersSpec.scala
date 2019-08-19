@@ -32,6 +32,7 @@ class TagWritersSpec
     maxBatchSize = 10,
     flushInterval = 10.seconds,
     scanningFlushInterval = 20.seconds,
+    stopTagWriterWhenIdle = 5.seconds,
     pubsubNotification = false)
 
   private def testProps(settings: TagWriterSettings, tagWriterCreator: String => ActorRef): Props =
@@ -123,6 +124,32 @@ class TagWritersSpec
       persistentActor ! PoisonPill
       blueProbe.expectMsg(DropState("pid1"))
       redProbe.expectMsg(DropState("pid1"))
+    }
+
+    "buffer requests when passivating" in {
+      val probe = TestProbe()
+      val tagWriters = system.actorOf(testProps(defaultSettings, _ => probe.ref))
+
+      tagWriters ! TagFlush("blue")
+      probe.expectMsg(Flush)
+
+      tagWriters.tell(PassivateTagWriter("blue"), probe.ref)
+      probe.expectMsg(StopTagWriter)
+
+      tagWriters ! FlushAllTagWriters(Timeout(remainingOrDefault))
+      // passivate in progress, so Flush is buffered
+      probe.expectNoMessage(100.millis)
+
+      val blueTagWrite = TagWrite("blue", Vector.empty)
+      tagWriters ! blueTagWrite
+      probe.expectNoMessage(100.millis)
+
+      tagWriters.tell(CancelPassivateTagWriter("blue"), probe.ref)
+      probe.expectMsg(Flush)
+      probe.reply(FlushComplete)
+      expectMsg(AllFlushed)
+
+      probe.expectMsg(blueTagWrite)
     }
   }
 

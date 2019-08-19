@@ -87,6 +87,7 @@ class CassandraJournalConfig(system: ActorSystem, config: Config)
     config.getInt("events-by-tag.max-message-batch-size"),
     config.getDuration("events-by-tag.flush-interval", TimeUnit.MILLISECONDS).millis,
     config.getDuration("events-by-tag.scanning-flush-interval", TimeUnit.MILLISECONDS).millis,
+    config.getDuration("events-by-tag.stop-tag-writer-when-idle", TimeUnit.MILLISECONDS).millis,
     config.getBoolean("pubsub-notification"))
 
   val coordinatedShutdownOnError: Boolean = config.getBoolean("coordinated-shutdown-on-error")
