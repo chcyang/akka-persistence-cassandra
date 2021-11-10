@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.journal
@@ -12,20 +12,15 @@ import akka.persistence.cassandra.CassandraLifecycle
 import akka.persistence.cassandra.CassandraSpec
 import akka.testkit._
 import com.typesafe.config.ConfigFactory
-import org.scalatest._
+import org.scalatest.matchers.should.Matchers
+import org.scalatest.wordspec.AnyWordSpecLike
 
 object CassandraLoadSpec {
-  val config = ConfigFactory
-    .parseString(if (CassandraLifecycle.isExternal) {
-      "akka.actor.serialize-messages=off"
-    } else {
-      s"""
-      cassandra-journal.replication-strategy = NetworkTopologyStrategy
-      cassandra-journal.data-center-replication-factors = ["dc1:1"]
+  val config = ConfigFactory.parseString(s"""
+      akka.persistence.cassandra.journal.replication-strategy = NetworkTopologyStrategy
+      akka.persistence.cassandra.journal.data-center-replication-factors = ["datacenter1:1"]
       akka.actor.serialize-messages=off
-     """
-    })
-    .withFallback(CassandraLifecycle.config)
+     """).withFallback(CassandraLifecycle.config)
 
   trait Measure { this: Actor =>
     val NanoToSecond = 1000.0 * 1000 * 1000
@@ -114,13 +109,10 @@ object CassandraLoadSpec {
 class CassandraLoadSpec
     extends CassandraSpec(CassandraLoadSpec.config)
     with ImplicitSender
-    with WordSpecLike
+    with AnyWordSpecLike
     with Matchers {
 
   import CassandraLoadSpec._
-
-  // use PropertyFileSnitch with cassandra-topology.properties
-  override def cassandraConfigResource: String = "test-embedded-cassandra-net.yaml"
 
   private def testThroughput(processor: ActorRef): Unit = {
     val warmCycles = 100L

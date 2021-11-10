@@ -1,20 +1,29 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
 
 import akka.annotation.InternalApi
+import akka.persistence.cassandra.PluginSettings
 
 /**
  * INTERNAL API
  */
 @InternalApi private[akka] trait CassandraReadStatements {
 
-  def config: CassandraReadJournalConfig
+  def settings: PluginSettings
+  private def journalSettings = settings.journalSettings
+  private def eventsByTagSettings = settings.eventsByTagSettings
 
-  private def tableName = s"${config.keyspace}.${config.table}"
-  private def tagViewTableName = s"${config.keyspace}.tag_views"
+  private def tableName = s"${journalSettings.keyspace}.${journalSettings.table}"
+  private def tagViewTableName = s"${journalSettings.keyspace}.${eventsByTagSettings.tagTable.name}"
+  private def allPersistenceIdsTableName = s"${journalSettings.keyspace}.${journalSettings.allPersistenceIdsTable}"
+
+  def selectAllPersistenceIds =
+    s"""
+      SELECT persistence_id FROM $allPersistenceIdsTableName
+     """
 
   def selectDistinctPersistenceIds =
     s"""

@@ -1,39 +1,30 @@
+import com.typesafe.sbt.packager.docker._
+
+ThisBuild / resolvers ++= {
+  if (System.getProperty("override.akka.version") != null) Seq("Akka Snapshots".at("https://repo.akka.io/snapshots/"))
+  else Seq.empty
+}
+
+// make version compatible with docker for publishing example project
+ThisBuild / dynverSeparator := "-"
+
 lazy val root = (project in file("."))
   .enablePlugins(Common, ScalaUnidocPlugin)
   .disablePlugins(SitePlugin)
-  .aggregate(core, cassandraLauncher, session)
+  .aggregate(core, cassandraLauncher)
   .settings(name := "akka-persistence-cassandra-root", publish / skip := true)
 
-lazy val session = (project in file("session"))
-  .enablePlugins(Common, AutomateHeaderPlugin, SbtOsgi)
-  .dependsOn(cassandraLauncher % Test)
-  .settings(osgiSettings: _*)
-  .settings(name := "akka-cassandra-session", libraryDependencies ++= Dependencies.akkaCassandraSessionDependencies)
+lazy val dumpSchema = taskKey[Unit]("Dumps cassandra schema for docs")
+dumpSchema := (core / runMain in (Test)).toTask(" akka.persistence.cassandra.PrintCreateStatements").value
 
 lazy val core = (project in file("core"))
-  .enablePlugins(Common, AutomateHeaderPlugin, SbtOsgi, MultiJvmPlugin)
-  .dependsOn(cassandraLauncher % Test, session)
-  .settings(osgiSettings: _*)
-  .settings({
-    val silencerVersion = "1.4.1"
-    Seq(
-      libraryDependencies ++= Seq(
-          compilerPlugin("com.github.ghik" %% "silencer-plugin" % silencerVersion),
-          "com.github.ghik" %% "silencer-lib" % silencerVersion % Provided),
-      // Hack because 'provided' dependencies by default are not picked up by the multi-jvm plugin:
-      managedClasspath in MultiJvm ++= (managedClasspath in Compile).value.filter(_.data.name.contains("silencer-lib")))
-  })
+  .enablePlugins(Common, AutomateHeaderPlugin, MultiJvmPlugin)
+  .dependsOn(cassandraLauncher % Test)
   .settings(
     name := "akka-persistence-cassandra",
     libraryDependencies ++= Dependencies.akkaPersistenceCassandraDependencies,
     Compile / packageBin / packageOptions += Package.ManifestAttributes(
-        "Automatic-Module-Name" -> "akka.persistence.cassandra"),
-    OsgiKeys.exportPackage := Seq("akka.persistence.cassandra.*"),
-    OsgiKeys.importPackage := Seq(akkaImport(), optionalImport("org.apache.cassandra.*"), "*"),
-    OsgiKeys.privatePackage := Nil,
-    testOptions in Test ++= Seq(
-        Tests.Argument(TestFrameworks.ScalaTest, "-o"),
-        Tests.Argument(TestFrameworks.ScalaTest, "-h", "target/test-reports")))
+        "Automatic-Module-Name" -> "akka.persistence.cassandra"))
   .configs(MultiJvm)
 
 lazy val cassandraLauncher = (project in file("cassandra-launcher"))
@@ -57,46 +48,97 @@ lazy val cassandraBundle = (project in file("cassandra-bundle"))
     target in assembly := target.value / "bundle" / "akka" / "persistence" / "cassandra" / "launcher",
     assemblyJarName in assembly := "cassandra-bundle.jar")
 
+// Used for testing events by tag in various environments
+lazy val endToEndExample = (project in file("example"))
+  .dependsOn(core)
+  .settings(libraryDependencies ++= Dependencies.exampleDependencies, publish / skip := true)
+  .settings(
+    dockerBaseImage := "openjdk:8-jre-alpine",
+    dockerCommands :=
+      dockerCommands.value.flatMap {
+        case ExecCmd("ENTRYPOINT", args @ _*) => Seq(Cmd("ENTRYPOINT", args.mkString(" ")))
+        case v                                => Seq(v)
+      },
+    dockerExposedPorts := Seq(8080, 8558, 2552),
+    dockerUsername := Some("kubakka"),
+    dockerUpdateLatest := true,
+    // update if deploying to some where that can't see docker hu
+    //dockerRepository := Some("some-registry"),
+    dockerCommands ++= Seq(
+        Cmd("USER", "root"),
+        Cmd("RUN", "/sbin/apk", "add", "--no-cache", "bash", "bind-tools", "busybox-extras", "curl", "iptables"),
+        Cmd(
+          "RUN",
+          "/sbin/apk",
+          "add",
+          "--no-cache",
+          "jattach",
+          "--repository",
+          "http://dl-cdn.alpinelinux.org/alpine/edge/community/"),
+        Cmd("RUN", "chgrp -R 0 . && chmod -R g=u .")),
+    // Docker image is only for running in k8s
+    javaOptions in Universal ++= Seq("-J-Dconfig.resource=kubernetes.conf"))
+  .enablePlugins(DockerPlugin, JavaAppPackaging)
+
+lazy val dseTest =
+  (project in file("dse-test"))
+    .dependsOn(core % "test->test")
+    .settings(libraryDependencies ++= Dependencies.dseTestDependencies)
+
 lazy val docs = project
   .enablePlugins(Common, AkkaParadoxPlugin, ParadoxSitePlugin, PreprocessPlugin, PublishRsyncPlugin)
+  .dependsOn(core)
   .settings(
     name := "Akka Persistence Cassandra",
+    (Compile / paradox) := (Compile / paradox).dependsOn(root / dumpSchema).value,
     publish / skip := true,
     whitesourceIgnore := true,
     makeSite := makeSite.dependsOn(LocalRootProject / ScalaUnidoc / doc).value,
     previewPath := (Paradox / siteSubdirName).value,
-    Preprocess / siteSubdirName := s"api/akka-persistence-cassandra/${if (isSnapshot.value) "snapshot"
-      else version.value}",
+    Preprocess / siteSubdirName := s"api/akka-persistence-cassandra/${projectInfoVersion.value}",
     Preprocess / sourceDirectory := (LocalRootProject / ScalaUnidoc / unidoc / target).value,
-    Preprocess / preprocessRules := Seq(("\\.java\\.scala".r, _ => ".java")),
-    Paradox / siteSubdirName := s"docs/akka-persistence-cassandra/${if (isSnapshot.value) "snapshot" else version.value}",
-    paradoxProperties ++= Map(
+    Paradox / siteSubdirName := s"docs/akka-persistence-cassandra/${projectInfoVersion.value}",
+    Compile / paradoxProperties ++= Map(
+        "project.url" -> "https://doc.akka.io/docs/akka-persistence-cassandra/current/",
+        "canonical.base_url" -> "https://doc.akka.io/docs/akka-persistence-cassandra/current",
         "akka.version" -> Dependencies.AkkaVersion,
         // Akka
-        "extref.akka.base_url" -> s"https://doc.akka.io/docs/akka/${Dependencies.AkkaVersion}/%s",
-        "scaladoc.akka.base_url" -> s"https://doc.akka.io/api/akka/${Dependencies.AkkaVersion}/",
-        "javadoc.akka.base_url" -> s"https://doc.akka.io/japi/akka/${Dependencies.AkkaVersion}/",
+        "extref.akka.base_url" -> s"https://doc.akka.io/docs/akka/${Dependencies.AkkaVersionInDocs}/%s",
+        "scaladoc.akka.base_url" -> s"https://doc.akka.io/api/akka/${Dependencies.AkkaVersionInDocs}/",
+        "javadoc.akka.base_url" -> s"https://doc.akka.io/japi/akka/${Dependencies.AkkaVersionInDocs}/",
+        // Alpakka
+        "extref.alpakka.base_url" -> s"https://doc.akka.io/docs/alpakka/${Dependencies.AlpakkaVersionInDocs}/%s",
+        "scaladoc.akka.stream.alpakka.base_url" -> s"https://doc.akka.io/api/alpakka/${Dependencies.AlpakkaVersionInDocs}/",
+        "javadoc.akka.stream.alpakka.base_url" -> "",
+        // APC 0.x
+        "extref.apc-0.x.base_url" -> s"https://doc.akka.io/docs/akka-persistence-cassandra/0.103/%s",
         // Cassandra
         "extref.cassandra.base_url" -> s"https://cassandra.apache.org/doc/${Dependencies.CassandraVersionInDocs}/%s",
+        // Datastax Java driver
+        "extref.java-driver.base_url" -> s"https://docs.datastax.com/en/developer/java-driver/${Dependencies.DriverVersionInDocs}/%s",
+        "javadoc.com.datastax.oss.base_url" -> s"https://docs.datastax.com/en/drivers/java/${Dependencies.DriverVersionInDocs}/",
         // Java
         "javadoc.base_url" -> "https://docs.oracle.com/javase/8/docs/api/",
         // Scala
         "scaladoc.scala.base_url" -> s"https://www.scala-lang.org/api/${scalaBinaryVersion.value}.x/",
-        "scaladoc.akka.persistence.cassandra.base_url" -> {
-          val docsHost = sys.env.get("CI").map(_ => "https://doc.akka.io").getOrElse("")
-          s"$docsHost/api/akka-persistence-cassandra/${if (isSnapshot.value) "snapshot" else version.value}/"
-        }),
+        "scaladoc.akka.persistence.cassandra.base_url" -> s"/${(Preprocess / siteSubdirName).value}/",
+        "javadoc.akka.persistence.cassandra.base_url" -> ""), // no Javadoc is published
     paradoxGroups := Map("Language" -> Seq("Java", "Scala")),
+    ApidocPlugin.autoImport.apidocRootPackage := "akka",
     resolvers += Resolver.jcenterRepo,
     publishRsyncArtifact := makeSite.value -> "www/",
-    publishRsyncHost := "akkarepo@gustav.akka.io")
+    publishRsyncHost := "akkarepo@gustav.akka.io",
+    apidocRootPackage := "akka")
 
-def akkaImport(packageName: String = "akka.*") =
-  versionedImport(packageName, "2.4", "2.5")
-def configImport(packageName: String = "com.typesafe.config.*") =
-  versionedImport(packageName, "1.3.0", "1.4.0")
-def versionedImport(packageName: String, lower: String, upper: String) =
-  s"""$packageName;version="[$lower,$upper)""""
-def optionalImport(packageName: String) = s"$packageName;resolution:=optional"
+TaskKey[Unit]("verifyCodeFmt") := {
+  scalafmtCheckAll.all(ScopeFilter(inAnyProject)).result.value.toEither.left.foreach { _ =>
+    throw new MessageOnlyException(
+      "Unformatted Scala code found. Please run 'scalafmtAll' and commit the reformatted code")
+  }
+  (Compile / scalafmtSbtCheck).result.value.toEither.left.foreach { _ =>
+    throw new MessageOnlyException(
+      "Unformatted sbt code found. Please run 'scalafmtSbt' and commit the reformatted code")
+  }
+}
 
-ThisBuild / dynverSonatypeSnapshots := true
+addCommandAlias("verifyCodeStyle", "headerCheckAll; verifyCodeFmt")

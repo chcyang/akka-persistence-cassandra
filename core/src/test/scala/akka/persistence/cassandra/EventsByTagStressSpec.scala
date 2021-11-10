@@ -1,13 +1,10 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra
 
-import java.time.{ LocalDateTime, ZoneOffset }
-
 import akka.persistence.cassandra.query.TestActor
-import akka.persistence.cassandra.query._
 import akka.persistence.journal.Tagged
 import akka.persistence.query.NoOffset
 import akka.stream.testkit.TestSubscriber
@@ -17,13 +14,10 @@ import scala.collection.immutable
 import scala.concurrent.Future
 
 class EventsByTagStressSpec extends CassandraSpec(s"""
-    cassandra-journal {
+    akka.persistence.cassandra {
       events-by-tag {
         max-message-batch-size = 25
       }
-    }
-    cassandra-query-journal {
-       first-time-bucket = "${LocalDateTime.now(ZoneOffset.UTC).minusHours(2).format(firstBucketFormatter)}"
     }
   """) {
 

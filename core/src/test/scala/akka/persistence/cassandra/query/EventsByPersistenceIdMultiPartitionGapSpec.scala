@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
@@ -14,11 +14,11 @@ import com.typesafe.config.ConfigFactory
 object EventsByPersistenceIdMultiPartitionGapSpec {
   val config = ConfigFactory.parseString(s"""
     akka.loglevel = INFO
-    cassandra-query-journal.refresh-interval = 0.5s
-    cassandra-query-journal.max-result-size-query = 2
-    cassandra-query-journal.events-by-persistence-id-gap-timeout = 4 seconds
-    cassandra-journal.target-partition-size = 15
-    cassandra-query-journal.gap-free-sequence-numbers = off
+    akka.persistence.cassandra.journal.target-partition-size = 15
+    akka.persistence.cassandra.query.refresh-interval = 0.5s
+    akka.persistence.cassandra.query.max-result-size-query = 2
+    akka.persistence.cassandra.query.events-by-persistence-id-gap-timeout = 4 seconds
+    akka.persistence.cassandra.query.gap-free-sequence-numbers = off
     akka.stream.materializer.max-input-buffer-size = 4 # there is an async boundary
     """).withFallback(CassandraLifecycle.config)
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.journal
@@ -15,11 +15,10 @@ import scala.concurrent.duration._
 object RecoveryLoadSpec {
   val config = ConfigFactory.parseString(s"""
       akka.loglevel = INFO
-      cassandra-journal.events-by-tag.enabled = on
-      cassandra-journal.events-by-tag.scanning-flush-interval = 2s
-      cassandra-journal.replay-filter.mode = off
-      cassandra-journal.log-queries = off
-      cassandra-snapshot-store.log-queries = off
+      akka.persistence.cassandra.events-by-tag.enabled = on
+      akka.persistence.cassandra.events-by-tag.scanning-flush-interval = 2s
+      akka.persistence.cassandra.journal.replay-filter.mode = off
+      akka.persistence.cassandra.log-queries = off
     """).withFallback(CassandraLifecycle.config)
 
   final case class Init(numberOfEvents: Int)

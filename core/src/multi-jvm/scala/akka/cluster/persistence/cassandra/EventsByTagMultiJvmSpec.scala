@@ -14,7 +14,8 @@ import akka.stream.ActorMaterializer
 import akka.stream.testkit.TestSubscriber
 import akka.stream.testkit.scaladsl.TestSink
 import com.typesafe.config.ConfigFactory
-import org.scalatest.{ Matchers, WordSpecLike }
+import org.scalatest.matchers.should.Matchers
+import org.scalatest.wordspec.AnyWordSpecLike
 
 object EventsByTagMultiJvmSpec extends MultiNodeConfig {
   // No way to start and distribute the port so hard coding
@@ -33,22 +34,18 @@ object EventsByTagMultiJvmSpec extends MultiNodeConfig {
         testconductor.barrier-timeout = 60 s
       }
 
-      cassandra-journal {
-        keyspace = $name
-        port = $CassPort
-
+      akka.persistence.cassandra {
+        journal {
+          keyspace = $name
+        }
+        
         events-by-tag {
           bucket-size = Minute
         }
-
-      }
-      cassandra-snapshot-store {
-        keyspace = $name
-        port = $CassPort
-      }
-      cassandra-query-journal {
-       first-time-bucket = "${LocalDateTime.now(ZoneOffset.UTC).minusMinutes(10).format(firstBucketFormatter)}"
-       # first-time-bucket = "${LocalDateTime.now(ZoneOffset.UTC).minusSeconds(10).format(firstBucketFormatter)}"
+        
+        snapshot {
+          keyspace = $name
+        }
       }
     """).withFallback(CassandraLifecycle.config))
 
@@ -61,7 +58,7 @@ class EventsByTagSpecMultiJvmNode3 extends EventsByTagMultiJvmSpec
 abstract class EventsByTagMultiJvmSpec
     extends MultiNodeSpec(EventsByTagMultiJvmSpec)
     with MultiNodeClusterSpec
-    with WordSpecLike
+    with AnyWordSpecLike
     with Matchers {
 
   import EventsByTagMultiJvmSpec._

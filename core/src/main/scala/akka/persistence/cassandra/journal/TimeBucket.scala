@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.journal
@@ -7,13 +7,15 @@ package akka.persistence.cassandra.journal
 import java.util.UUID
 
 import akka.annotation.InternalApi
+import akka.persistence.cassandra.BucketSize
 import akka.util.HashCode
-import com.datastax.driver.core.utils.UUIDs
+import com.datastax.oss.driver.api.core.uuid.Uuids
 
+/** INTERNAL API */
 @InternalApi private[akka] object TimeBucket {
 
   def apply(timeuuid: UUID, bucketSize: BucketSize): TimeBucket =
-    apply(UUIDs.unixTimestamp(timeuuid), bucketSize)
+    apply(Uuids.unixTimestamp(timeuuid), bucketSize)
 
   def apply(epochTimestamp: Long, bucketSize: BucketSize): TimeBucket =
     // round down to bucket size so the times are deterministic
@@ -25,6 +27,7 @@ import com.datastax.driver.core.utils.UUIDs
   }
 }
 
+/** INTERNAL API */
 @InternalApi private[akka] final class TimeBucket private (val key: Long, val bucketSize: BucketSize) {
   def inPast: Boolean =
     key < TimeBucket.roundDownBucketSize(System.currentTimeMillis(), bucketSize)
@@ -35,7 +38,7 @@ import com.datastax.driver.core.utils.UUIDs
   }
 
   def within(uuid: UUID): Boolean = {
-    val when = UUIDs.unixTimestamp(uuid)
+    val when = Uuids.unixTimestamp(uuid)
     when >= key && when < (key + bucketSize.durationMillis)
   }
 
@@ -51,6 +54,9 @@ import com.datastax.driver.core.utils.UUIDs
 
   def <(other: TimeBucket): Boolean =
     key < other.key
+
+  def <=(other: TimeBucket): Boolean =
+    key <= other.key
 
   override def equals(other: Any): Boolean = other match {
     case that: TimeBucket =>

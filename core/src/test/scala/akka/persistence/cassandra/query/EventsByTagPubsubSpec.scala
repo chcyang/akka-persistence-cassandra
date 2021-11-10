@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
@@ -8,14 +8,12 @@ import java.time.{ LocalDate, ZoneOffset }
 
 import akka.cluster.Cluster
 import akka.persistence.cassandra.CassandraSpec
-import akka.persistence.cassandra.journal.CassandraJournalConfig
+import akka.persistence.cassandra.journal.JournalSettings
 import akka.persistence.query.{ EventEnvelope, NoOffset }
 import akka.stream.testkit.scaladsl.TestSink
 import com.typesafe.config.ConfigFactory
 
-import scala.concurrent.Await
 import scala.concurrent.duration._
-import scala.util.Try
 
 object EventsByTagPubsubSpec {
   val today = LocalDate.now(ZoneOffset.UTC)
@@ -27,16 +25,13 @@ object EventsByTagPubsubSpec {
     akka.remote.netty.tcp.port = 0
     akka.remote.artery.canonical.port = 0
     akka.remote.netty.tcp.hostname = "127.0.0.1"
-    cassandra-journal {
-      pubsub-notification = on
+    akka.persistence.cassandra {
+      
+      query.refresh-interval = 10s
 
       events-by-tag {
+        pubsub-notification = on
         flush-interval = 0ms
-      }
-    }
-    cassandra-query-journal {
-      refresh-interval = 10s
-      events-by-tag {
         eventual-consistency-delay = 0s
       }
     }
@@ -45,21 +40,11 @@ object EventsByTagPubsubSpec {
 
 class EventsByTagPubsubSpec extends CassandraSpec(EventsByTagPubsubSpec.config) {
 
-  val writePluginConfig = new CassandraJournalConfig(system, system.settings.config.getConfig("cassandra-journal"))
-  lazy val session = {
-    import system.dispatcher
-    Await.result(writePluginConfig.sessionProvider.connect(), 5.seconds)
-  }
+  val journalSettings = new JournalSettings(system, system.settings.config.getConfig("akka.persistence.cassandra"))
 
   override protected def beforeAll(): Unit = {
     super.beforeAll()
     Cluster(system).join(Cluster(system).selfAddress)
-  }
-
-  override protected def afterAll(): Unit = {
-    Try(session.close())
-    Try(session.getCluster.close())
-    super.afterAll()
   }
 
   "Cassandra query getEventsByTag when running clustered with pubsub enabled" must {

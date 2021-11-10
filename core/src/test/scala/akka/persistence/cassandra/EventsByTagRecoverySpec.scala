@@ -1,10 +1,8 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra
-
-import java.time.{ LocalDateTime, ZoneOffset }
 
 import akka.actor.{ ActorSystem, PoisonPill }
 import akka.persistence.cassandra.TestTaggingActor.{ Ack, DoASnapshotPlease, SnapShotAck }
@@ -15,27 +13,21 @@ import akka.testkit.TestProbe
 import com.typesafe.config.ConfigFactory
 
 import scala.concurrent.duration._
-import scala.util.Try
 
 object EventsByTagRecoverySpec {
-  val today = LocalDateTime.now(ZoneOffset.UTC)
   val keyspaceName = "EventsByTagRecoverySpec"
   val config = ConfigFactory.parseString(s"""
        akka {
          actor.debug.unhandled = on
        }
-       cassandra-journal {
-         keyspace = $keyspaceName
+       akka.persistence.cassandra {
+         journal.keyspace = $keyspaceName
          log-queries = off
          events-by-tag {
             max-message-batch-size = 2
             bucket-size = "Day"
          }
-       }
-       cassandra-snapshot-store.keyspace=$keyspaceName
-       
-       cassandra-query-journal = {
-          first-time-bucket = "${today.minusMinutes(5).format(query.firstBucketFormatter)}"
+         snapshot.keyspace=$keyspaceName
        }
        
        akka.actor.serialize-messages=off
@@ -43,20 +35,6 @@ object EventsByTagRecoverySpec {
 }
 
 class EventsByTagRecoverySpec extends CassandraSpec(EventsByTagRecoverySpec.config) {
-
-  import EventsByTagRecoverySpec._
-
-  lazy val session = {
-    cluster.connect(keyspaceName)
-  }
-
-  override protected def afterAll(): Unit = {
-    super.afterAll()
-    Try {
-      session.close()
-      cluster.close()
-    }
-  }
 
   val waitTime = 100.milliseconds
 
@@ -125,8 +103,8 @@ class EventsByTagRecoverySpec extends CassandraSpec(EventsByTagRecoverySpec.conf
 
         Thread.sleep(500)
         systemTwo.terminate().futureValue
-        session.execute(s"truncate tag_views")
-        session.execute(s"truncate tag_write_progress")
+        cluster.execute(s"truncate ${journalName}.tag_views")
+        cluster.execute(s"truncate ${journalName}.tag_write_progress")
 
         val tProbe = TestProbe()(system)
         val p2take2 = system.actorOf(TestTaggingActor.props("p2", Set("red", "orange")))
@@ -171,8 +149,8 @@ class EventsByTagRecoverySpec extends CassandraSpec(EventsByTagRecoverySpec.conf
         Thread.sleep(500)
 
         systemTwo.terminate().futureValue
-        session.execute(s"truncate tag_views")
-        session.execute(s"truncate tag_write_progress")
+        cluster.execute(s"truncate ${journalName}.tag_views")
+        cluster.execute(s"truncate ${journalName}.tag_write_progress")
 
         val tProbe = TestProbe()(system)
         val p3take2 = system.actorOf(TestTaggingActor.props("p3", Set("red", "orange")))

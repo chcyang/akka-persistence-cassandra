@@ -1,12 +1,12 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.compaction
 
 import com.typesafe.config.{ Config, ConfigFactory }
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 /*
  * Based upon https://github.com/apache/cassandra/blob/cassandra-2.2/src/java/org/apache/cassandra/db/compaction/AbstractCompactionStrategy.java
@@ -59,8 +59,6 @@ object BaseCompactionStrategy extends CassandraCompactionStrategyConfig[BaseComp
     className match {
       case TimeWindowCompactionStrategy.ClassName =>
         TimeWindowCompactionStrategy.fromConfig(config)
-      case DateTieredCompactionStrategy.ClassName =>
-        DateTieredCompactionStrategy.fromConfig(config)
       case LeveledCompactionStrategy.ClassName =>
         LeveledCompactionStrategy.fromConfig(config)
       case SizeTieredCompactionStrategy.ClassName =>

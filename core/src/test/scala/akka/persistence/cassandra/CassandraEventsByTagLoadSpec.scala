@@ -1,15 +1,12 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra
 
-import java.time.{ LocalDateTime, ZoneOffset }
-
 import akka.persistence.cassandra.TestTaggingActor.Ack
 import akka.persistence.cassandra.query.scaladsl.CassandraReadJournal
 import akka.persistence.query.{ NoOffset, PersistenceQuery }
-import akka.stream.ActorMaterializer
 import akka.stream.scaladsl._
 import akka.stream.testkit.scaladsl.TestSink
 import com.typesafe.config.ConfigFactory
@@ -18,19 +15,15 @@ import org.scalatest.time.{ Seconds, Span }
 import scala.concurrent.duration._
 
 object CassandraEventsByTagLoadSpec {
-  val today = LocalDateTime.now(ZoneOffset.UTC)
 
   val config = ConfigFactory.parseString(s"""
-       cassandra-journal {
+       akka.persistence.cassandra {
          log-queries = off
          events-by-tag {
             max-message-batch-size = 25
             bucket-size = "Minute"
          }
-       }
-       cassandra-snapshot-store.keyspace=CassandraEventsByTagLoadSpecSnapshot
-       cassandra-query-journal = {
-          first-time-bucket = "${today.minusMinutes(5).format(query.firstBucketFormatter)}"
+         snapshot.keyspace=CassandraEventsByTagLoadSpecSnapshot
        }
        akka.actor.serialize-messages=off
     """).withFallback(CassandraLifecycle.config)
@@ -38,7 +31,6 @@ object CassandraEventsByTagLoadSpec {
 
 class CassandraEventsByTagLoadSpec extends CassandraSpec(CassandraEventsByTagLoadSpec.config) {
 
-  implicit val materializer = ActorMaterializer()(system)
   implicit override val patienceConfig = PatienceConfig(timeout = Span(60, Seconds), interval = Span(5, Seconds))
 
   val nrPersistenceIds = 50L
@@ -60,7 +52,7 @@ class CassandraEventsByTagLoadSpec extends CassandraSpec(CassandraEventsByTagLoa
       }
 
       val readJournal =
-        PersistenceQuery(system).readJournalFor[CassandraReadJournal]("cassandra-query-journal")
+        PersistenceQuery(system).readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
 
       eventTags.foreach({ tag =>
         try {
@@ -80,7 +72,7 @@ class CassandraEventsByTagLoadSpec extends CassandraSpec(CassandraEventsByTagLoa
 
   private def validateTagStream(readJournal: CassandraReadJournal)(tag: String): Unit = {
     system.log.info(s"Validating tag $tag")
-    val probe = readJournal.eventsByTag("orange", NoOffset).toMat(TestSink.probe)(Keep.right).run
+    val probe = readJournal.eventsByTag("orange", NoOffset).toMat(TestSink.probe)(Keep.right).run()
     var sequenceNrsPerPid = Map[String, Long]()
     var allReceived: Map[String, List[Long]] = Map.empty.withDefaultValue(List.empty)
     probe.request(messagesPerPersistenceId * nrPersistenceIds)

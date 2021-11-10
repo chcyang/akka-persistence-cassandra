@@ -1,44 +1,40 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.journal
 
 import akka.actor.Actor
-import akka.cassandra.session.CassandraMetricsRegistry
+import akka.persistence.CapabilityFlag
 import akka.persistence.{ AtomicWrite, PersistentRepr }
 import akka.persistence.JournalProtocol.{ ReplayMessages, WriteMessageFailure, WriteMessages, WriteMessagesFailed }
 
 import scala.concurrent.duration._
 import akka.persistence.journal._
 import akka.persistence.cassandra.CassandraLifecycle
+import akka.stream.alpakka.cassandra.CassandraMetricsRegistry
 import akka.testkit.TestProbe
 import com.typesafe.config.ConfigFactory
 
 object CassandraJournalConfiguration {
-  lazy val config = ConfigFactory.parseString(s"""
-       |cassandra-journal.keyspace=CassandraJournalSpec
-       |cassandra-snapshot-store.keyspace=CassandraJournalSpecSnapshot
-    """.stripMargin).withFallback(CassandraLifecycle.config)
+  val config = ConfigFactory.parseString(s"""
+       akka.persistence.cassandra.journal.keyspace=CassandraJournalSpec
+       akka.persistence.cassandra.snapshot.keyspace=CassandraJournalSpecSnapshot
+       datastax-java-driver {
+         basic.session-name = CassandraJournalSpec
+         advanced.metrics {
+           session.enabled = [ "bytes-sent", "cql-requests"]
+         }
+       }  
+    """).withFallback(CassandraLifecycle.config)
 
-  lazy val perfConfig = ConfigFactory.parseString("""
+  lazy val perfConfig =
+    ConfigFactory.parseString("""
     akka.actor.serialize-messages=off
-    cassandra-journal.keyspace=CassandraJournalPerfSpec
-    cassandra-snapshot-store.keyspace=CassandraJournalPerfSpecSnapshot
+    akka.persistence.cassandra.journal.keyspace=CassandraJournalPerfSpec
+    akka.persistence.cassandra.snapshot.keyspace=CassandraJournalPerfSpecSnapshot
     """).withFallback(config)
 
-  lazy val protocolV3Config = ConfigFactory.parseString(s"""
-      cassandra-journal.protocol-version = 3
-      cassandra-journal.enable-events-by-tag-query = off
-      cassandra-journal.keyspace=CassandraJournalProtocolV3Spec
-      cassandra-snapshot-store.keyspace=CassandraJournalProtocolV3Spec
-    """).withFallback(config)
-
-  lazy val compat2Config = ConfigFactory.parseString(s"""
-      cassandra-journal.cassandra-2x-compat = on
-      cassandra-journal.keyspace=CassandraJournalCompat2Spec
-      cassandra-snapshot-store.keyspace=CassandraJournalCompat2Spec
-    """).withFallback(config)
 }
 
 // Can't use CassandraSpec so needs to do its own clean up
@@ -50,8 +46,10 @@ class CassandraJournalSpec extends JournalSpec(CassandraJournalConfiguration.con
   "A Cassandra Journal" must {
     "insert Cassandra metrics to Cassandra Metrics Registry" in {
       val registry = CassandraMetricsRegistry(system).getRegistry
-      val snapshots = registry.getNames.toArray()
-      snapshots.length should be > 0
+      val metricsNames = registry.getNames.toArray.toSet
+      // metrics category is the configPath of the plugin + the session-name
+      metricsNames should contain("akka.persistence.cassandra.CassandraJournalSpec.bytes-sent")
+      metricsNames should contain("akka.persistence.cassandra.CassandraJournalSpec.cql-requests")
     }
     "be able to replay messages after serialization failure" in {
       // there is no chance that a journal could create a data representation for type of event
@@ -69,7 +67,7 @@ class CassandraJournalSpec extends JournalSpec(CassandraJournalConfiguration.con
 
       journal ! WriteMessages(List(AtomicWrite(msg)), probe.ref, actorInstanceId)
       val err = probe.expectMsgPF() {
-        case WriteMessagesFailed(cause) => cause
+        case fail: WriteMessagesFailed => fail.cause
       }
       probe.expectMsg(WriteMessageFailure(msg, err, actorInstanceId))
 
@@ -79,27 +77,11 @@ class CassandraJournalSpec extends JournalSpec(CassandraJournalConfiguration.con
   }
 }
 
-/**
- * Cassandra 2.2.0 or later should support protocol version V4, but as long as we
- * support 2.1.6+ we do some compatibility testing with V3.
- */
-class CassandraJournalProtocolV3Spec
-    extends JournalSpec(CassandraJournalConfiguration.protocolV3Config)
-    with CassandraLifecycle {
-  override def systemName: String = "CassandraJournalProtocolV3Spec"
+class CassandraJournalMetaSpec extends JournalSpec(CassandraJournalConfiguration.config) with CassandraLifecycle {
+  override def systemName: String = "CassandraJournalSpec"
 
   override def supportsRejectingNonSerializableObjects = false
-
-}
-
-class CassandraJournalCompat2Spec
-    extends JournalSpec(CassandraJournalConfiguration.compat2Config)
-    with CassandraLifecycle {
-
-  override def systemName: String = "CassandraJournalCompat2Spec"
-
-  override def supportsRejectingNonSerializableObjects = false
-
+  protected override def supportsMetadata: CapabilityFlag = true
 }
 
 class CassandraJournalPerfSpec

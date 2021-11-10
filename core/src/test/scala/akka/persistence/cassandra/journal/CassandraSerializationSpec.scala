@@ -1,13 +1,12 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.journal
 
 import akka.actor.{ ExtendedActorSystem, Props }
 import akka.persistence.RecoveryCompleted
-import akka.persistence.cassandra.EventWithMetaData.UnknownMetaData
-import akka.persistence.cassandra.{ CassandraLifecycle, CassandraSpec, EventWithMetaData, Persister }
+import akka.persistence.cassandra.{ CassandraLifecycle, CassandraSpec, Persister }
 import akka.serialization.BaseSerializer
 import akka.testkit.TestProbe
 import com.typesafe.config.ConfigFactory
@@ -23,10 +22,10 @@ object CassandraSerializationSpec {
        |akka.persistence.journal.max-deletion-batch-size = 3
        |akka.persistence.publish-confirmations = on
        |akka.persistence.publish-plugin-commands = on
-       |cassandra-journal.target-partition-size = 5
-       |cassandra-journal.max-result-size = 3
-       |cassandra-journal.keyspace=CassandraIntegrationSpec
-       |cassandra-snapshot-store.keyspace=CassandraIntegrationSpecSnapshot
+       |akka.persistence.cassandra.journal.target-partition-size = 5
+       |akka.persistence.cassandra.max-result-size = 3
+       |akka.persistence.cassandra.journal.keyspace=CassandraIntegrationSpec
+       |akka.persistence.cassandra.snapshot.keyspace=CassandraIntegrationSpecSnapshot
        |
     """.stripMargin).withFallback(CassandraLifecycle.config)
 
@@ -62,40 +61,6 @@ class CassandraSerializationSpec extends CassandraSpec(CassandraSerializationSpe
       val incarnation2 = system.actorOf(Props(new Persister("id1", probe.ref)))
       probe.expectMsgType[RuntimeException].getMessage shouldBe "I can't deserialize a single thing"
       incarnation2
-    }
-
-    "be able to store meta data" in {
-      val probe = TestProbe()
-      val incarnation1 = system.actorOf(Props(new Persister("id2", probe.ref)))
-      probe.expectMsgType[RecoveryCompleted]
-
-      val eventWithMeta = EventWithMetaData("TheActualEvent", "TheAdditionalMetaData")
-      incarnation1 ! eventWithMeta
-      probe.expectMsg(eventWithMeta)
-
-      probe.watch(incarnation1)
-      system.stop(incarnation1)
-      probe.expectTerminated(incarnation1)
-
-      system.actorOf(Props(new Persister("id2", probe.ref)))
-      probe.expectMsg(eventWithMeta) // from replay
-    }
-
-    "not fail replay due to deserialization problem of meta data" in {
-      val probe = TestProbe()
-      val incarnation1 = system.actorOf(Props(new Persister("id3", probe.ref)))
-      probe.expectMsgType[RecoveryCompleted]
-
-      val eventWithMeta = EventWithMetaData("TheActualEvent", CrapEvent(13))
-      incarnation1 ! eventWithMeta
-      probe.expectMsg(eventWithMeta)
-
-      probe.watch(incarnation1)
-      system.stop(incarnation1)
-      probe.expectTerminated(incarnation1)
-
-      system.actorOf(Props(new Persister("id3", probe.ref)))
-      probe.expectMsg(EventWithMetaData("TheActualEvent", UnknownMetaData(666, ""))) // from replay, no meta
     }
 
   }

@@ -1,67 +1,56 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
 
 import java.util.UUID
 
+import scala.concurrent.duration._
+
 import akka.NotUsed
 import akka.actor.ActorRef
-import akka.persistence.cassandra.{ CassandraLifecycle, CassandraPluginConfig, CassandraSpec }
+import akka.persistence.cassandra.CassandraLifecycle
+import akka.persistence.cassandra.CassandraSpec
+import akka.persistence.cassandra.journal.JournalSettings
 import akka.stream.scaladsl.Source
 import akka.stream.testkit.scaladsl.TestSink
-import com.datastax.driver.core.Session
 import com.typesafe.config.ConfigFactory
 import org.scalatest.BeforeAndAfterEach
 
-import scala.concurrent.Await
-import scala.concurrent.duration._
-import scala.util.Try
-
 object AllPersistenceIdsSpec {
   val config = ConfigFactory.parseString(s"""
-    cassandra-query-journal.max-buffer-size = 10
-    cassandra-query-journal.refresh-interval = 0.5s
-    cassandra-query-journal.max-result-size-query = 10
-    cassandra-journal.target-partition-size = 15
+    akka.persistence.cassandra {
+      journal.target-partition-size = 15
+      query {
+        max-buffer-size = 10
+        refresh-interval = 0.5s
+        max-result-size-query = 10
+      }
+    }  
     """).withFallback(CassandraLifecycle.config)
 }
 
 class AllPersistenceIdsSpec extends CassandraSpec(AllPersistenceIdsSpec.config) with BeforeAndAfterEach {
 
-  val cfg = system.settings.config.getConfig("cassandra-journal")
-  val pluginConfig = new CassandraPluginConfig(system, cfg)
-
-  var session: Session = _
-
-  override protected def beforeAll(): Unit = {
-    super.beforeAll()
-    import system.dispatcher
-    session = Await.result(pluginConfig.sessionProvider.connect(), 5.seconds)
-  }
-
-  override protected def afterAll(): Unit = {
-    Try {
-      session.close()
-      session.getCluster.close()
-    }
-    super.afterAll()
-  }
+  val cfg = system.settings.config.getConfig("akka.persistence.cassandra")
+  val journalSettings = new JournalSettings(system, cfg)
 
   override protected def beforeEach() = {
     super.beforeEach()
     deleteAllEvents()
   }
 
-  def all(): Source[String, NotUsed] = queries.persistenceIds().filterNot(_ == "persistenceInit")
+  def all(): Source[String, NotUsed] = queries.persistenceIds().filterNot(_.startsWith("persistenceInit"))
 
-  def current(): Source[String, NotUsed] = queries.currentPersistenceIds().filterNot(_ == "persistenceInit")
+  def current(): Source[String, NotUsed] = queries.currentPersistenceIds().filterNot(_.startsWith("persistenceInit"))
 
-  private[this] def deleteAllEvents(): Unit =
-    session.execute(s"TRUNCATE ${pluginConfig.keyspace}.${pluginConfig.table}")
+  private def deleteAllEvents(): Unit = {
+    cluster.execute(s"TRUNCATE ${journalSettings.keyspace}.${journalSettings.table}")
+    cluster.execute(s"TRUNCATE ${journalSettings.keyspace}.${journalSettings.allPersistenceIdsTable}")
+  }
 
-  private[this] def setup(persistenceId: String, n: Int): ActorRef = {
+  private def setup(persistenceId: String, n: Int): ActorRef = {
     val ref = system.actorOf(TestActor.props(persistenceId))
     for (i <- 1 to n) {
       ref ! s"$persistenceId-$i"
@@ -166,6 +155,17 @@ class AllPersistenceIdsSpec extends CassandraSpec(AllPersistenceIdsSpec.config) 
       setup("q", 1000)
 
       probe.request(10).expectNext("q").expectNoMessage(1000.millis)
+    }
+  }
+
+  "Cassandra query CurrentPersistenceIdsFromMessages" must {
+    "find existing events" in {
+      setup("a2", 1)
+      setup("b2", 1)
+      setup("c2", 1)
+
+      val src = queries.currentPersistenceIdsFromMessages().filterNot(_.startsWith("persistenceInit"))
+      src.runWith(TestSink.probe[Any]).request(4).expectNextUnordered("a2", "b2", "c2").expectComplete()
     }
   }
 }

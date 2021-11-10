@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
@@ -17,10 +17,10 @@ object EventsByPersistenceIdFastForwardSpec {
 
   // separate from EventsByPersistenceIdWithControlSpec since it needs the refreshing enabled
   val config = ConfigFactory.parseString(s"""
-    cassandra-journal.keyspace=EventsByPersistenceIdFastForwardSpec
-    cassandra-query-journal.refresh-interval = 250ms
-    cassandra-query-journal.max-result-size-query = 2
-    cassandra-journal.target-partition-size = 15
+    akka.persistence.cassandra.journal.keyspace=EventsByPersistenceIdFastForwardSpec
+    akka.persistence.cassandra.query.refresh-interval = 250ms
+    akka.persistence.cassandra.query.max-result-size-query = 2
+    akka.persistence.cassandra.journal.target-partition-size = 15
     """).withFallback(CassandraLifecycle.config)
 }
 

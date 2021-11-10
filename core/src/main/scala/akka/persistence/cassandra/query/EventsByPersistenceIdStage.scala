@@ -1,52 +1,38 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
 
 import java.lang.{ Long => JLong }
-import java.nio.ByteBuffer
-import java.util.UUID
 import java.util.concurrent.ThreadLocalRandom
 
 import akka.Done
 import akka.annotation.InternalApi
-import akka.persistence.PersistentRepr
-import akka.persistence.cassandra.journal.CassandraJournal.{ EventDeserializer, Serialized }
-import akka.serialization.Serialization
 import akka.stream.{ Attributes, Outlet, SourceShape }
-import akka.cassandra.session._
 import akka.stream.stage._
-import com.datastax.driver.core._
-import com.datastax.driver.core.policies.RetryPolicy
-import com.datastax.driver.core.utils.Bytes
-
+import com.datastax.oss.driver.api.core.cql._
 import scala.annotation.tailrec
-import scala.collection.JavaConverters._
 import scala.concurrent.{ ExecutionContext, Future, Promise }
 import scala.concurrent.duration.{ FiniteDuration, _ }
 import scala.util.{ Failure, Success, Try }
-import akka.util.OptionVal
-import com.github.ghik.silencer.silent
+
+import com.datastax.oss.driver.api.core.CqlSession
+import scala.annotation.nowarn
+import scala.compat.java8.FutureConverters._
+
+import akka.persistence.cassandra.PluginSettings
 
 /**
  * INTERNAL API
  */
 @InternalApi private[akka] object EventsByPersistenceIdStage {
 
-  private[akka] case class TaggedPersistentRepr(pr: PersistentRepr, tags: Set[String], offset: UUID) {
-    def sequenceNr: Long = pr.sequenceNr
-  }
-
-  private[akka] case class OptionalTagged(sequenceNr: Long, tagged: OptionVal[TaggedPersistentRepr])
-
-  private[akka] case class RawEvent(sequenceNr: Long, serialized: Serialized)
-
   // materialized value
   trait Control {
 
     /**
-     * Trigger a request to fetch more eventEvens.
+     * Trigger a request to fetch more events.
      */
     def poll(knownSeqNr: Long): Unit
 
@@ -69,39 +55,33 @@ import com.github.ghik.silencer.silent
       selectEventsByPersistenceIdQuery: PreparedStatement,
       selectSingleRowQuery: PreparedStatement,
       selectDeletedToQuery: PreparedStatement,
-      session: Session,
-      customConsistencyLevel: Option[ConsistencyLevel],
-      customRetryPolicy: Option[RetryPolicy]) {
+      session: CqlSession,
+      profile: String) {
 
     def selectEventsByPersistenceId(
         persistenceId: String,
         partitionNr: Long,
         progress: Long,
-        toSeqNr: Long,
-        fetchSize: Int)(implicit ec: ExecutionContext): Future[ResultSet] = {
+        toSeqNr: Long): Future[AsyncResultSet] = {
       val boundStatement =
-        selectEventsByPersistenceIdQuery.bind(persistenceId, partitionNr: JLong, progress: JLong, toSeqNr: JLong)
-      boundStatement.setFetchSize(fetchSize)
+        selectEventsByPersistenceIdQuery
+          .bind(persistenceId, partitionNr: JLong, progress: JLong, toSeqNr: JLong)
+          .setExecutionProfileName(profile)
       executeStatement(boundStatement)
     }
 
     def selectSingleRow(persistenceId: String, pnr: Long)(implicit ec: ExecutionContext): Future[Option[Row]] = {
-      val boundStatement = selectSingleRowQuery.bind(persistenceId, pnr: JLong)
-      session.executeAsync(boundStatement).asScala.map(rs => Option(rs.one()))
+      val boundStatement = selectSingleRowQuery.bind(persistenceId, pnr: JLong).setExecutionProfileName(profile)
+      session.executeAsync(boundStatement).toScala.map(rs => Option(rs.one()))
     }
 
     def highestDeletedSequenceNumber(persistenceId: String)(implicit ec: ExecutionContext): Future[Long] =
-      executeStatement(selectDeletedToQuery.bind(persistenceId)).map(r =>
+      executeStatement(selectDeletedToQuery.bind(persistenceId).setExecutionProfileName(profile)).map(r =>
         Option(r.one()).map(_.getLong("deleted_to")).getOrElse(0))
 
-    private def executeStatement(statement: Statement)(implicit ec: ExecutionContext): Future[ResultSet] =
-      session.executeAsync(withCustom(statement)).asScala
+    private def executeStatement(statement: Statement[_]): Future[AsyncResultSet] =
+      session.executeAsync(statement).toScala
 
-    private def withCustom(statement: Statement): Statement = {
-      customConsistencyLevel.foreach(statement.setConsistencyLevel)
-      customRetryPolicy.foreach(statement.setRetryPolicy)
-      statement
-    }
   }
 
   private case object Continue
@@ -113,104 +93,9 @@ import com.github.ghik.silencer.silent
   private case object QueryIdle extends QueryState
   private final case class QueryInProgress(switchPartition: Boolean, fetchMore: Boolean, startTime: Long)
       extends QueryState
-  private final case class QueryResult(resultSet: ResultSet, empty: Boolean, switchPartition: Boolean)
+  private final case class QueryResult(resultSet: AsyncResultSet, empty: Boolean, switchPartition: Boolean)
       extends QueryState {
     override def toString: String = s"QueryResult($switchPartition)"
-  }
-
-  object Extractors {
-
-    abstract class Extractor[T](val eventDeserializer: EventDeserializer, val serialization: Serialization) {
-      def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[T]
-    }
-
-    final case class SeqNrValue(sequenceNr: Long)
-
-    final case class PersistentReprValue(persistentRepr: PersistentRepr) {
-      def sequenceNr: Long = persistentRepr.sequenceNr
-    }
-
-    def persistentRepr(ed: EventDeserializer, s: Serialization): Extractor[PersistentReprValue] =
-      new Extractor[PersistentReprValue](ed, s) {
-        override def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[PersistentReprValue] =
-          extractPersistentRepr(row, ed, s, async).map(PersistentReprValue.apply)
-      }
-
-    def taggedPersistentRepr(ed: EventDeserializer, s: Serialization): Extractor[TaggedPersistentRepr] =
-      new Extractor[TaggedPersistentRepr](ed, s) {
-        override def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[TaggedPersistentRepr] =
-          extractPersistentRepr(row, ed, s, async).map { persistentRepr =>
-            val tags = extractTags(row, ed)
-            TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
-          }
-      }
-
-    def optionalTaggedPersistentRepr(ed: EventDeserializer, s: Serialization): Extractor[OptionalTagged] =
-      new Extractor[OptionalTagged](ed, s) {
-        override def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[OptionalTagged] = {
-          val seqNr = row.getLong("sequence_nr")
-          val tags = extractTags(row, ed)
-          if (tags.isEmpty) {
-            // no tags, no need to extract more
-            Future.successful(OptionalTagged(seqNr, OptionVal.None))
-          } else {
-            extractPersistentRepr(row, ed, s, async).map { persistentRepr =>
-              val tagged = TaggedPersistentRepr(persistentRepr, tags, row.getUUID("timestamp"))
-              OptionalTagged(seqNr, OptionVal.Some(tagged))
-            }
-          }
-        }
-      }
-
-    // TODO performance improvement could be to use another query that is not "select *"
-    def sequenceNumber(ed: EventDeserializer, s: Serialization): Extractor[SeqNrValue] =
-      new Extractor[SeqNrValue](ed, s) {
-        override def extract(row: Row, async: Boolean)(implicit ec: ExecutionContext): Future[SeqNrValue] =
-          Future.successful(SeqNrValue(row.getLong("sequence_nr")))
-      }
-
-    private def extractPersistentRepr(row: Row, ed: EventDeserializer, s: Serialization, async: Boolean)(
-        implicit ec: ExecutionContext): Future[PersistentRepr] =
-      row.getBytes("message") match {
-        case null =>
-          ed.deserializeEvent(row, async).map { payload =>
-            PersistentRepr(
-              payload,
-              sequenceNr = row.getLong("sequence_nr"),
-              persistenceId = row.getString("persistence_id"),
-              manifest = row.getString("event_manifest"), // manifest for event adapters
-              deleted = false,
-              sender = null,
-              writerUuid = row.getString("writer_uuid"))
-          }
-        case b =>
-          // for backwards compatibility
-          Future.successful(persistentFromByteBuffer(s, b))
-      }
-
-    private def extractTags(row: Row, ed: EventDeserializer): Set[String] = {
-      // TODO can be removed in 1.0, this is only used during migration from the old version on initial recovery
-      val oldTags: Set[String] =
-        if (ed.hasOldTagsColumns(row)) {
-          (1 to 3).foldLeft(Set.empty[String]) {
-            case (acc, i) =>
-              val tag = row.getString(s"tag$i")
-              if (tag != null) acc + tag
-              else acc
-          }
-        } else Set.empty
-
-      val newTags: Set[String] =
-        if (ed.hasTagsColumn(row))
-          row.getSet("tags", classOf[String]).asScala.toSet
-        else Set.empty
-
-      oldTags.union(newTags)
-    }
-
-    def persistentFromByteBuffer(serialization: Serialization, b: ByteBuffer): PersistentRepr =
-      // we know that such old rows can't have meta data because that feature was added later
-      serialization.deserialize(Bytes.getArray(b), classOf[PersistentRepr]).get
   }
 }
 
@@ -222,14 +107,15 @@ import com.github.ghik.silencer.silent
     fromSeqNr: Long,
     toSeqNr: Long,
     max: Long,
-    fetchSize: Int,
     refreshInterval: Option[FiniteDuration],
     session: EventsByPersistenceIdStage.EventsByPersistenceIdSession,
-    config: CassandraReadJournalConfig,
+    settings: PluginSettings,
     fastForwardEnabled: Boolean = false)
     extends GraphStageWithMaterializedValue[SourceShape[Row], EventsByPersistenceIdStage.Control] {
 
   import EventsByPersistenceIdStage._
+  import settings.querySettings
+  import settings.journalSettings
 
   val out: Outlet[Row] = Outlet("EventsByPersistenceId.out")
   override val shape: SourceShape[Row] = SourceShape(out)
@@ -241,7 +127,6 @@ import com.github.ghik.silencer.silent
         classOf[EventsByPersistenceIdStage]
 
       implicit def ec = materializer.executionContext
-      val fetchMoreThresholdRows = (fetchSize * config.fetchMoreThreshold).toInt
 
       val donePromise = Promise[Done]()
 
@@ -255,14 +140,14 @@ import com.github.ghik.silencer.silent
 
       var queryState: QueryState = QueryIdle
 
-      val newResultSetCb = getAsyncCallback[Try[ResultSet]] {
+      val newResultSetCb = getAsyncCallback[Try[AsyncResultSet]] {
         case Success(rs) =>
           val q = queryState match {
             case q: QueryInProgress => q
             case _ =>
               throw new IllegalStateException(s"New ResultSet when in unexpected state $queryState")
           }
-          val empty = rs.isExhausted() && !q.fetchMore
+          val empty = isExhausted(rs) && !q.fetchMore
           if (log.isDebugEnabled)
             log.debug(
               "EventsByPersistenceId [{}] Query took [{}] ms {}",
@@ -308,6 +193,42 @@ import com.github.ghik.silencer.silent
         }
       }
 
+      val highestDeletedSequenceNrCb = getAsyncCallback[Try[Long]] {
+        case Success(delSeqNr) =>
+          // lowest possible seqNr is 1
+          expectedNextSeqNr = math.max(delSeqNr + 1, math.max(fromSeqNr, 1))
+          partition = partitionNr(expectedNextSeqNr)
+          // initial query
+          queryState = QueryIdle
+          query(switchPartition = false)
+
+        case Failure(e) => onFailure(e)
+
+      }
+
+      val checkForGapsCb: AsyncCallback[(Int, Try[Option[Row]])] = getAsyncCallback {
+        case (foundEmptyPartitionCount, result) =>
+          result match {
+            case Success(mbRow) =>
+              mbRow.map(_.getLong("sequence_nr")) match {
+                case None | Some(0) =>
+                  // Some(0) when old schema with static used column, everything deleted in this partition
+                  if (foundEmptyPartitionCount == 5)
+                    completeStage()
+                  else {
+                    partition = partition + 1
+                    checkForGaps(foundEmptyPartitionCount + 1)
+                  }
+                case Some(_) =>
+                  if (foundEmptyPartitionCount == 0)
+                    partition = partition + 1
+                  query(switchPartition = false)
+              }
+            case Failure(_) =>
+              throw new IllegalStateException("Should not be able to get here")
+          }
+      }
+
       private def internalFastForward(nextSeqNr: Long): Unit = {
         log.debug(
           "EventsByPersistenceId [{}] External fast-forward to seqNr [{}] from current [{}]",
@@ -321,24 +242,11 @@ import com.github.ghik.silencer.silent
       }
 
       def partitionNr(sequenceNr: Long): Long =
-        (sequenceNr - 1L) / config.targetPartitionSize
+        (sequenceNr - 1L) / journalSettings.targetPartitionSize
 
       override def preStart(): Unit = {
         queryState = QueryInProgress(switchPartition = false, fetchMore = false, System.nanoTime())
-        session.highestDeletedSequenceNumber(persistenceId).onComplete {
-          getAsyncCallback[Try[Long]] {
-            case Success(delSeqNr) =>
-              // lowest possible seqNr is 1
-              expectedNextSeqNr = math.max(delSeqNr + 1, math.max(fromSeqNr, 1))
-              partition = partitionNr(expectedNextSeqNr)
-              // initial query
-              queryState = QueryIdle
-              query(switchPartition = false)
-
-            case Failure(e) => onFailure(e)
-
-          }.invoke
-        }
+        session.highestDeletedSequenceNumber(persistenceId).onComplete(highestDeletedSequenceNrCb.invoke)
 
         refreshInterval match {
           case Some(interval) =>
@@ -352,7 +260,7 @@ import com.github.ghik.silencer.silent
         }
       }
 
-      @silent("deprecated")
+      @nowarn("msg=deprecated")
       private def scheduleContinue(initial: FiniteDuration, interval: FiniteDuration): Unit = {
         schedulePeriodicallyWithInitialDelay(Continue, initial, interval)
       }
@@ -390,7 +298,7 @@ import com.github.ghik.silencer.silent
             onFailure(
               new IllegalStateException(
                 s"Sequence number [$expectedNextSeqNr] still missing after " +
-                s"[${config.eventsByPersistenceIdEventTimeout.pretty}], " +
+                s"[${querySettings.eventsByPersistenceIdEventTimeout.pretty}], " +
                 s"saw unexpected seqNr [${m.sawSeqNr}] for persistenceId [$persistenceId]."))
           case Some(_) =>
             queryState = QueryIdle
@@ -405,7 +313,7 @@ import com.github.ghik.silencer.silent
           case _: QueryInProgress =>
             throw new IllegalStateException("Query already in progress")
           case QueryResult(rs, _, _) =>
-            if (!rs.isExhausted)
+            if (!isExhausted(rs))
               throw new IllegalStateException("Previous query was not exhausted")
         }
         val pnr = if (switchPartition) partition + 1 else partition
@@ -428,7 +336,7 @@ import com.github.ghik.silencer.silent
             toSeqNr
         }
         session
-          .selectEventsByPersistenceId(persistenceId, pnr, expectedNextSeqNr, endNr, fetchSize)
+          .selectEventsByPersistenceId(persistenceId, pnr, expectedNextSeqNr, endNr)
           .onComplete(newResultSetCb.invoke)
       }
 
@@ -436,7 +344,6 @@ import com.github.ghik.silencer.silent
         tryPushOne()
 
       @tailrec private def tryPushOne(): Unit = {
-
         queryState match {
           case QueryResult(rs, empty, switchPartition) if isAvailable(out) =>
             def afterExhausted(): Unit = {
@@ -445,13 +352,13 @@ import com.github.ghik.silencer.silent
               // We keep track of if the query was such switching partition and if result is empty
               // we complete the stage or wait until next Continue tick.
               if (empty && switchPartition && lookingForMissingSeqNr.isEmpty) {
-                if (expectedNextSeqNr < toSeqNr && !config.gapFreeSequenceNumbers) {
+                if (expectedNextSeqNr < toSeqNr && !querySettings.gapFreeSequenceNumbers) {
                   log.warning(
                     s"Gap found! Checking if data in partition was deleted for {}, expected seq nr: {}, current partition nr: {}",
                     persistenceId,
                     expectedNextSeqNr,
                     partition)
-                  checkForGaps()
+                  checkForGaps(foundEmptyPartitionCount = 0)
                 } else if (refreshInterval.isEmpty) {
                   completeStage()
                 } else {
@@ -474,7 +381,7 @@ import com.github.ghik.silencer.silent
 
             if (reachedEndCondition())
               completeStage()
-            else if (rs.isExhausted) {
+            else if (isExhausted(rs)) {
               (lookingForMissingSeqNr, pendingFastForward) match {
                 case (Some(MissingSeqNr(_, sawSeqNr)), Some(fastForwardTo)) if fastForwardTo >= sawSeqNr =>
                   log.debug(
@@ -491,10 +398,10 @@ import com.github.ghik.silencer.silent
                 case _ =>
                   afterExhausted()
               }
-            } else if (rs.getAvailableWithoutFetching == 0) {
+            } else if (rs.remaining() == 0) {
               log.debug("EventsByPersistenceId [{}] Fetch more from seqNr [{}]", persistenceId, expectedNextSeqNr)
               queryState = QueryInProgress(switchPartition, fetchMore = true, System.nanoTime())
-              val rsFut = rs.fetchMoreResults().asScala
+              val rsFut = rs.fetchNextPage().toScala
               rsFut.onComplete(newResultSetCb.invoke)
             } else {
               val row = rs.one()
@@ -502,7 +409,7 @@ import com.github.ghik.silencer.silent
               if ((sequenceNr < expectedNextSeqNr && fastForwardEnabled) || pendingFastForward.isDefined && pendingFastForward.get > sequenceNr) {
                 // skip event due to fast forward
                 tryPushOne()
-              } else if (pendingFastForward.isEmpty && config.gapFreeSequenceNumbers && sequenceNr > expectedNextSeqNr) {
+              } else if (pendingFastForward.isEmpty && querySettings.gapFreeSequenceNumbers && sequenceNr > expectedNextSeqNr) {
                 // we will probably now come in here which isn't what we want
                 lookingForMissingSeqNr match {
                   case Some(_) =>
@@ -515,7 +422,7 @@ import com.github.ghik.silencer.silent
                       expectedNextSeqNr,
                       sequenceNr)
                     lookingForMissingSeqNr = Some(
-                      MissingSeqNr(Deadline.now + config.eventsByPersistenceIdEventTimeout, sequenceNr))
+                      MissingSeqNr(Deadline.now + querySettings.eventsByPersistenceIdEventTimeout, sequenceNr))
                     // Forget about any other rows in this result set until we find
                     // the missing sequence nrs
                     queryState = QueryIdle
@@ -537,10 +444,9 @@ import com.github.ghik.silencer.silent
                   if (refreshInterval.isEmpty) query(false)
                   else afterExhausted()
 
-                } else if (rs.isExhausted)
+                } else if (isExhausted(rs)) {
                   afterExhausted()
-                else if (rs.getAvailableWithoutFetching == fetchMoreThresholdRows)
-                  rs.fetchMoreResults() // trigger early async fetch of more rows
+                }
 
               }
             }
@@ -550,27 +456,13 @@ import com.github.ghik.silencer.silent
         }
       }
 
-      // The strategy is simple, if full partition was cleaned up we will find null-row
-      // i.e row: <persistence_id>, <partition_nr>, null, ...
-      // If such row exists, we have to switch partition and continue to fetching
-      def checkForGaps(): Unit = {
-        session.selectSingleRow(persistenceId, partition).onComplete {
-          getAsyncCallback[Try[Option[Row]]] {
-            case Success(mbRow) =>
-              val r = mbRow.map(row => (row.getBool("used"), row.getLong("sequence_nr")))
-              r match {
-                case Some((true, _)) =>
-                  //We increment partition nr manually, otherwise we will break `lookingForMissingSeqNr` logic
-                  partition = partition + 1
-                  query(switchPartition = false)
-                case _ =>
-                  //No data found, but at least we tried
-                  completeStage()
-              }
-            case Failure(exception) =>
-              throw new IllegalStateException("Should not be able to get here")
-          }.invoke
-        }
+      // See PR #509 for background
+      // Only used when gapFreeSequenceNumbers==false
+      // if full partition was cleaned up we look for two empty partitions before completing
+      def checkForGaps(foundEmptyPartitionCount: Int): Unit = {
+        session
+          .selectSingleRow(persistenceId, partition)
+          .onComplete(result => checkForGapsCb.invoke((foundEmptyPartitionCount, result)))
       }
 
       def extractSeqNr(row: Row): Long = row.getLong("sequence_nr")
@@ -595,7 +487,7 @@ import com.github.ghik.silencer.silent
 
         try fastForwardCb.invoke(nextSeqNr)
         catch {
-          case e: IllegalStateException =>
+          case _: IllegalStateException =>
           // not initialized, see Akka issue #20503, but that is ok since this
           // is just best effort
         }

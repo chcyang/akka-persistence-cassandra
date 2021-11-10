@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.journal
@@ -7,16 +7,19 @@ package akka.persistence.cassandra.journal
 import java.util.UUID
 
 import scala.concurrent.Await
-
 import akka.Done
 import akka.event.Logging
 import akka.persistence.PersistentRepr
 import akka.persistence.cassandra.journal.CassandraJournal.Serialized
-import akka.cassandra.session.scaladsl.CassandraSession
 import akka.persistence.cassandra.{ CassandraLifecycle, CassandraSpec, TestTaggingActor, _ }
 import akka.serialization.SerializationExtension
 import com.typesafe.config.ConfigFactory
-import scala.concurrent.{ ExecutionContext, Future }
+
+import scala.concurrent.ExecutionContext
+import scala.concurrent.Future
+import akka.actor.ExtendedActorSystem
+import akka.stream.alpakka.cassandra.CqlSessionProvider
+import akka.stream.alpakka.cassandra.scaladsl.CassandraSession
 
 object CassandraEventUpdateSpec {
   val config = ConfigFactory.parseString("""
@@ -31,17 +34,23 @@ class CassandraEventUpdateSpec extends CassandraSpec(CassandraEventUpdateSpec.co
   val updater = new CassandraEventUpdate {
 
     override private[akka] val log = s.log
-    override private[akka] def config: CassandraJournalConfig =
-      new CassandraJournalConfig(system, system.settings.config.getConfig("cassandra-journal"))
+    override private[akka] def settings: PluginSettings =
+      PluginSettings(system)
     override private[akka] implicit val ec: ExecutionContext = system.dispatcher
-    override private[akka] val session: CassandraSession = new CassandraSession(
-      system,
-      config.sessionProvider,
-      config.sessionSettings,
-      ec,
-      log,
-      systemName,
-      init = _ => Future.successful(Done))
+    // use separate session, not shared via CassandraSessionRegistry because init is different
+    private val sessionProvider =
+      CqlSessionProvider(
+        system.asInstanceOf[ExtendedActorSystem],
+        system.settings.config.getConfig(PluginSettings.DefaultConfigPath))
+    override private[akka] val session: CassandraSession =
+      new CassandraSession(
+        system,
+        sessionProvider,
+        ec,
+        log,
+        systemName,
+        init = _ => Future.successful(Done),
+        onClose = () => ())
   }
 
   "CassandraEventUpdate" must {

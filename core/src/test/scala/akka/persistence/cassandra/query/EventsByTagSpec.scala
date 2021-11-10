@@ -1,35 +1,38 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
 
 import java.time.temporal.ChronoUnit
 import java.time.{ LocalDateTime, ZoneOffset }
+import java.util.Optional
 import java.util.UUID
 
 import akka.actor.{ PoisonPill, Props }
 import akka.event.Logging.Warning
-import akka.persistence.cassandra.journal.{ CassandraJournalConfig, CassandraStatements, Day }
-import akka.persistence.cassandra.{ CassandraLifecycle, CassandraSpec, EventWithMetaData }
+import akka.persistence.cassandra.journal.CassandraJournalStatements
+import akka.persistence.cassandra.{ CassandraLifecycle, CassandraSpec, Day }
 import akka.persistence.journal.{ Tagged, WriteEventAdapter }
 import akka.persistence.query.scaladsl.{ CurrentEventsByTagQuery, EventsByTagQuery }
-import akka.persistence.query.{ EventEnvelope, NoOffset, TimeBasedUUID }
+import akka.persistence.query.{ EventEnvelope, NoOffset, Offset, TimeBasedUUID }
 import akka.persistence.{ PersistentActor, PersistentRepr }
 import akka.serialization.SerializationExtension
 import akka.stream.testkit.TestSubscriber
 import akka.stream.testkit.scaladsl.TestSink
 import EventsByTagSpec._
+import akka.event.Logging
 import akka.testkit.TestProbe
+import com.datastax.oss.driver.api.core.CqlIdentifier
+import com.datastax.oss.driver.api.core.uuid.Uuids
 import com.typesafe.config.{ Config, ConfigFactory }
 import org.scalatest.BeforeAndAfterEach
-
-import scala.concurrent.Await
 import scala.concurrent.duration._
-import scala.util.Try
+
+import akka.persistence.cassandra.PluginSettings
 
 object EventsByTagSpec {
-  def withProbe(probe: TestSubscriber.Probe[Any], f: TestSubscriber.Probe[Any] => Unit): Unit = {
+  def withProbe[T](probe: TestSubscriber.Probe[Any], f: TestSubscriber.Probe[Any] => T): T = {
     try {
       f(probe)
     } finally {
@@ -42,41 +45,39 @@ object EventsByTagSpec {
   val config = ConfigFactory.parseString(s"""
     akka.actor.serialize-messages = off
     akka.actor.warn-about-java-serializer-usage = off
-    cassandra-journal {
-      #target-partition-size = 5
+    akka.persistence.cassandra {
+      journal {
+        #target-partition-size = 5
 
-      event-adapters {
-        color-tagger  = akka.persistence.cassandra.query.ColorFruitTagger
-        metadata-tagger  = akka.persistence.cassandra.query.EventWithMetaDataTagger
+        event-adapters {
+          color-tagger  = akka.persistence.cassandra.query.ColorFruitTagger
+        }
+  
+        event-adapter-bindings = {
+          "java.lang.String" = color-tagger
+        }
       }
-
-      event-adapter-bindings = {
-        "java.lang.String" = color-tagger
-        "akka.persistence.cassandra.EventWithMetaData" = metadata-tagger
+      
+      query {
+        refresh-interval = 500ms
+        max-buffer-size = 50
       }
 
       events-by-tag {
+        first-time-bucket = "${today.minusDays(5).format(firstBucketFormatter)}"
         flush-interval = 0ms
+        eventual-consistency-delay = 2s
         bucket-size = Day
         time-to-live = 1d
       }
 
       # coordinated-shutdown-on-error = on
     }
-
-    cassandra-query-journal {
-      refresh-interval = 500ms
-      max-buffer-size = 50
-      first-time-bucket = "${today.minusDays(5).format(firstBucketFormatter)}"
-      events-by-tag {
-        eventual-consistency-delay = 2s
-      }
-    }
     """).withFallback(CassandraLifecycle.config)
 
   val strictConfig = ConfigFactory.parseString(s"""
-    cassandra-query-journal {
-      refresh-interval = 100ms
+    akka.persistence.cassandra {
+      query.refresh-interval = 100ms
       events-by-tag {
         gap-timeout = 5s
         new-persistence-id-scan-timeout = 200s
@@ -87,28 +88,34 @@ object EventsByTagSpec {
 
   val strictConfigFirstOffset1001DaysAgo = ConfigFactory.parseString(s"""
     akka.loglevel = INFO # DEBUG is very verbose for this test so don't turn it on when debugging other tests
-    cassandra-query-journal.first-time-bucket = "${today.minusDays(1001).format(firstBucketFormatter)}"
+    akka.persistence.cassandra.events-by-tag.first-time-bucket = "${today.minusDays(1001).format(firstBucketFormatter)}"
     """).withFallback(strictConfig)
 
+  val persistenceIdCleanupConfig =
+    ConfigFactory.parseString("""
+       akka.persistence.cassandra.events-by-tag {
+          eventual-consistency-delay = 0s
+          # will test by requiring a new persistence-id search every 2s
+          new-persistence-id-scan-timeout = 500ms
+          cleanup-old-persistence-ids = 1s
+          back-track {
+            // need to be smaller than the cleanup old persistence ids
+            period = 800ms  
+            long-period = 850ms
+          }
+       }
+      """).withFallback(config)
+
   val disabledConfig = ConfigFactory.parseString("""
-      cassandra-journal {
-        keyspace=EventsByTagDisabled
+      akka.persistence.cassandra {
+        journal.keyspace=EventsByTagDisabled
         events-by-tag.enabled = false
       }
     """).withFallback(config)
 }
 
-class EventWithMetaDataTagger extends WriteEventAdapter {
-  override def manifest(event: Any) = ""
-  override def toJournal(event: Any) = event match {
-    case evm: EventWithMetaData =>
-      Tagged(evm, Set("gotmeta"))
-    case _ => event
-  }
-}
-
 class ColorFruitTagger extends WriteEventAdapter {
-  val colors = Set("green", "black", "blue", "yellow")
+  val colors = Set("green", "black", "blue", "yellow", "orange")
   val fruits = Set("apple", "banana")
   override def toJournal(event: Any): Any = event match {
     case s: String =>
@@ -132,33 +139,28 @@ abstract class AbstractEventsByTagSpec(config: Config)
   val waitTime = 100.millis
 
   val serialization = SerializationExtension(system)
-  val writePluginConfig = new CassandraJournalConfig(system, system.settings.config.getConfig("cassandra-journal"))
-
-  lazy val session = {
-    import system.dispatcher
-    Await.result(writePluginConfig.sessionProvider.connect(), 5.seconds)
-  }
+  val settings = PluginSettings(system)
 
   lazy val preparedWriteMessage = {
-    val writeStatements: CassandraStatements = new CassandraStatements {
-      def config: CassandraJournalConfig = writePluginConfig
-    }
-    session.prepare(writeStatements.writeMessage(withMeta = false))
-  }
-
-  override protected def afterAll(): Unit = {
-    Try(session.close())
-    Try(session.getCluster.close())
-    super.afterAll()
+    val writeStatements: CassandraJournalStatements = new CassandraJournalStatements(settings)
+    cluster.prepare(writeStatements.writeMessage(withMeta = false))
   }
 
   val logProbe = TestProbe()
   system.eventStream.subscribe(logProbe.ref, classOf[Warning])
-  system.eventStream.subscribe(logProbe.ref, classOf[Error])
+  system.eventStream.subscribe(logProbe.ref, classOf[Logging.Error])
+
+  /**
+   * By default all warnings and errors are considered a failure
+   */
+  protected val logCheck: PartialFunction[Any, Any] = {
+    case msg => msg
+  }
 
   override protected def afterEach(): Unit = {
     // check for the buffer exceeded log (and other issues)
-    logProbe.expectNoMessage(waitTime)
+    val messages = logProbe.receiveWhile(waitTime)(logCheck)
+    messages shouldEqual Nil
     super.afterEach()
   }
 }
@@ -169,11 +171,10 @@ class EventsByTagSpec extends AbstractEventsByTagSpec(EventsByTagSpec.config) {
 
   "Cassandra query currentEventsByTag" must {
     "set ttl on table" in {
-      session.getCluster.getMetadata
-        .getKeyspace(journalName)
-        .getTable("tag_views")
-        .getOptions
-        .getDefaultTimeToLive shouldEqual 86400
+      cluster.refreshSchema()
+      val options = cluster.getMetadata.getKeyspace(journalName).get.getTable("tag_views").get().getOptions
+
+      options.get(CqlIdentifier.fromCql("default_time_to_live")) shouldEqual 86400
     }
 
     "implement standard CurrentEventsByTagQuery" in {
@@ -292,6 +293,27 @@ class EventsByTagSpec extends AbstractEventsByTagSpec(EventsByTagSpec.config) {
       probe2.cancel()
     }
 
+    "include timestamp in EventEnvelope" in {
+      val currentTime = System.currentTimeMillis()
+      val greenSrc1 = queries.currentEventsByTag(tag = "green", offset = NoOffset)
+      val probe1 = greenSrc1.runWith(TestSink.probe[EventEnvelope])
+      probe1.request(2)
+
+      val env1 = probe1.expectNext()
+      env1.timestamp should !==(0L)
+      (currentTime - env1.timestamp) should be < 120000L
+      (currentTime - env1.timestamp) should be > 0L
+
+      val env2 = probe1.expectNext()
+      env2.timestamp should !==(0L)
+      (currentTime - env2.timestamp) should be < 120000L
+      (currentTime - env2.timestamp) should be > 0L
+
+      env2.timestamp should be >= env1.timestamp
+
+      probe1.cancel()
+    }
+
     "find existing events that spans several time buckets" in {
       val t1 = today.minusDays(5).toLocalDate.atStartOfDay.plusHours(13)
       val w1 = UUID.randomUUID().toString
@@ -397,6 +419,27 @@ class EventsByTagSpec extends AbstractEventsByTagSpec(EventsByTagSpec.config) {
       })
     }
 
+    "include timestamp in EventEnvelope" in {
+      val currentTime = System.currentTimeMillis()
+      val greenSrc1 = queries.eventsByTag(tag = "green", offset = NoOffset)
+      val probe1 = greenSrc1.runWith(TestSink.probe[EventEnvelope])
+      probe1.request(2)
+
+      val env1 = probe1.expectNext()
+      env1.timestamp should !==(0L)
+      (currentTime - env1.timestamp) should be < 120000L
+      (currentTime - env1.timestamp) should be > 0L
+
+      val env2 = probe1.expectNext()
+      env2.timestamp should !==(0L)
+      (currentTime - env2.timestamp) should be < 120000L
+      (currentTime - env2.timestamp) should be > 0L
+
+      env2.timestamp should be >= env1.timestamp
+
+      probe1.cancel()
+    }
+
     "find new events that spans several time buckets" in {
       val t1 = today.minusDays(5).toLocalDate.atStartOfDay.plusHours(13)
       val w1 = UUID.randomUUID().toString
@@ -423,9 +466,7 @@ class EventsByTagSpec extends AbstractEventsByTagSpec(EventsByTagSpec.config) {
       })
     }
 
-    // note that the test below works if another event from p2 to come
-    // then we go back and look for e1 from p1
-    "sort events by timestamp" ignore {
+    "sort events by timestamp" in {
       val t1 = LocalDateTime.now(ZoneOffset.UTC).minusSeconds(10)
       val w1 = UUID.randomUUID().toString
       val w2 = UUID.randomUUID().toString
@@ -447,7 +488,8 @@ class EventsByTagSpec extends AbstractEventsByTagSpec(EventsByTagSpec.config) {
 
         probe.expectNextPF { case e @ EventEnvelope(_, "p1", 1L, "p1-e1") => e }
         probe.expectNextPF { case e @ EventEnvelope(_, "p2", 1L, "p2-e1") => e }
-        probe.expectNextPF { case e @ EventEnvelope(_, "p1", 2L, "p1-e2") => e }
+        val e3 = probe.expectNextPF { case e @ EventEnvelope(_, "p1", 2L, "p1-e2") => e }
+        (System.currentTimeMillis() - e3.timestamp) should be < 10000L
       })
     }
 
@@ -483,23 +525,19 @@ class EventsByTagSpec extends AbstractEventsByTagSpec(EventsByTagSpec.config) {
         })
     }
 
-    "return events with their metadata" in {
-      val w1 = system.actorOf(TestActor.props("W1"))
-      withProbe(queries.eventsByTag(tag = "gotmeta", offset = NoOffset).runWith(TestSink.probe[Any]), probe => {
-        w1 ! EventWithMetaData("e1", "this is such a good message")
-        probe.request(2)
-        probe.expectNextPF {
-          case EventEnvelope(_, "W1", 1L, EventWithMetaData("e1", "this is such a good message")) =>
-        }
-        probe.expectNoMessage(waitTime)
-      })
+    "not complete for empty query" in {
+      val probe = queries.eventsByTag(tag = "empty", offset = NoOffset).runWith(TestSink.probe[Any])
+      probe.request(2)
+      probe.expectNoMessage(waitTime)
+      probe.cancel()
     }
   }
 }
 
 class EventsByTagZeroEventualConsistencyDelaySpec
-    extends AbstractEventsByTagSpec(ConfigFactory.parseString("""
-            cassandra-query-journal.eventual-consistency-delay = 0s
+    extends AbstractEventsByTagSpec(
+      ConfigFactory.parseString("""
+            akka.persistence.cassandra.query.eventual-consistency-delay = 0s
           """).withFallback(EventsByTagSpec.strictConfig)) {
 
   "Cassandra query currentEventsByTag with zero eventual-consistency-delay" must {
@@ -547,8 +585,8 @@ class EventsByTagFindDelayedEventsSpec
 # find delayed events from offset relies on this as it puts an event before the offset that will not
 # be found and one after that will be found for a new persistence id
 # have it at least 2x the interval so searching for missing tries trice
-cassandra-query-journal.events-by-tag.new-persistence-id-scan-timeout = 600ms
-cassandra-query-journal.events-by-tag.refresh-internal = 100ms
+akka.persistence.cassandra.events-by-tag.new-persistence-id-scan-timeout = 600ms
+akka.persistence.cassandra.events-by-tag.refresh-internal = 100ms
 
 """)
         .withFallback(EventsByTagSpec.strictConfig)) {
@@ -785,6 +823,58 @@ class EventsByTagStrictBySeqNoEarlyFirstOffsetSpec
   }
 }
 
+class EventsByTagLongRefreshIntervalSpec
+    extends AbstractEventsByTagSpec(
+      ConfigFactory.parseString("""
+     akka.loglevel = INFO 
+     akka.persistence.cassandra {
+       query.refresh-interval = 10s # set large enough so that it will fail the test if a refresh is required to continue the stream
+       events-by-tag {
+         gap-timeout = 30s
+         offset-scanning-period = 0ms # do no scanning so each new persistence id triggers the search
+         eventual-consistency-delay = 0ms  # speed up the test
+       }
+     } 
+     """).withFallback(config)) {
+
+  override protected val logCheck: PartialFunction[Any, Any] = {
+    case m: Warning if !m.message.toString.contains("eventual consistency set below 1 second") => m
+    case m: Logging.Error                                                                      => m
+  }
+
+  "only look for new-persistence-id timeout for previous events for new persistence ids" in {
+    val pid = "test-new-pid"
+    val sender = TestProbe()
+    val pa = system.actorOf(TestActor.props(pid))
+    pa.tell(Tagged("cat", Set("animal")), sender.ref)
+    sender.expectMsg("cat-done")
+    sender.expectNoMessage(200.millis) // try and give time for the tagged event to be flushed so the query doesn't need to wait for the refresh interval
+
+    val offset: Offset =
+      withProbe(queries.eventsByTag(tag = "animal", offset = NoOffset).runWith(TestSink.probe[Any]), probe => {
+        probe.request(2)
+        probe.expectNextPF {
+          case EventEnvelope(offset, `pid`, 1L, "cat") =>
+            offset
+        }
+      })
+
+    pa.tell(Tagged("cat2", Set("animal")), sender.ref)
+    sender.expectMsg("cat2-done")
+    // flush interval for tag writes is 0ms but still give some time for the tag write to complete
+    sender.expectNoMessage(250.millis)
+
+    withProbe(queries.eventsByTag(tag = "animal", offset = offset).runWith(TestSink.probe[Any]), probe => {
+      probe.request(2)
+      // less than the refresh interval, previously this would evaluate the new persistence-id timeout and then not re-evaluate
+      // it again until the next refresh interval
+      probe.expectNextWithTimeoutPF(2.seconds, {
+        case EventEnvelope(_, `pid`, 2L, "cat2") =>
+      })
+    })
+  }
+}
+
 class EventsByTagStrictBySeqNoManyInCurrentTimeBucketSpec
     extends AbstractEventsByTagSpec(EventsByTagSpec.strictConfig) {
 
@@ -970,8 +1060,254 @@ class EventsByTagStrictBySeqMemoryIssueSpec extends AbstractEventsByTagSpec(Even
 
       probe.request(100)
       probe.expectNextN(30)
-      probe.expectComplete
+      probe.expectComplete()
     }
+  }
+}
+class EventsByTagSpecBackTrackingLongRefreshInterval
+    extends AbstractEventsByTagSpec(
+      ConfigFactory.parseString("""
+    akka.persistence.cassandra.query.refresh-interval = 10s
+    akka.persistence.cassandra.events-by-tag {
+     back-track {
+        interval = 500ms
+        period = max
+      }
+      eventual-consistency-delay = 100ms
+      // stops the looking for missing query from happening again too frequently so
+      // ensure we do a query in both buckets each time
+      gap-timeout = 10s
+    }
+    """).withFallback(config)) {
+
+  override protected val logCheck: PartialFunction[Any, Any] = {
+    case m: Warning if !m.message.toString.contains("eventual consistency set below 1 second") => m
+    case m: Logging.Error                                                                      => m
+  }
+
+  "Backtracking" must {
+    "find in the previous bucket without needing a refresh" in {
+      val tagName = "back-track-previous-bucket-no-refresh"
+      writeTaggedEvent(PersistentRepr("e1", 1L, "p2", ""), Set(tagName), 1, bucketSize)
+      val src = queries.eventsByTag(tag = tagName, offset = NoOffset)
+      val probe = src.runWith(TestSink.probe[Any])
+      probe.request(10)
+      // bring the offset forward with an event for a new persistence id
+      probe.expectNextPF { case e @ EventEnvelope(_, "p2", 1L, "e1") => e }
+      // now a delayed events for p1 in the previous bucket, should be found by the short back track
+      writeTaggedEvent(
+        today.minusDays(1).minusHours(1),
+        PersistentRepr("e1", 1L, "p1", ""),
+        Set(tagName),
+        1,
+        bucketSize)
+      // much smaller than the refresh interval
+      probe.expectNextWithTimeoutPF(3.seconds, { case e @ EventEnvelope(_, "p1", 1L, "e1") => e })
+    }
+  }
+
+}
+
+class EventsByTagSpecBackTracking
+    extends AbstractEventsByTagSpec(
+      ConfigFactory.parseString("""
+// this slows down the test too much for all the expectNexts
+//  akka.persistence.cassandra.query.refresh-interval = 4s
+    akka.persistence.cassandra.events-by-tag {
+     back-track {
+        interval = 1s
+        period = 10m
+        long-interval = 4s
+        long-period = max
+      }
+      eventual-consistency-delay = 100ms
+      // stops the looking for missing query from happening again too frequently so
+      // ensure we do a query in both buckets each time
+      gap-timeout = 10s
+    }
+    """).withFallback(config)) {
+
+  "Delayed events" must {
+    "be found even if there are no more events for that persistence id" in {
+
+      val t1 = today.minusMinutes(5)
+      writeTaggedEvent(t1, PersistentRepr("e1", 1L, "p1", ""), Set("back-track"), 1, bucketSize)
+      writeTaggedEvent(t1.plusMinutes(1), PersistentRepr("e2", 2L, "p1", ""), Set("back-track"), 2, bucketSize)
+
+      val src = queries.eventsByTag(tag = "back-track", offset = NoOffset)
+      val probe = src.runWith(TestSink.probe[Any])
+      probe.request(10)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 1L, "e1") => e }
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 2L, "e2") => e }
+
+      // bring the offset forward with an event for a new persistence id
+      writeTaggedEvent(today, PersistentRepr("e1", 1L, "p2", ""), Set("back-track"), 1, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p2", 1L, "e1") => e }
+
+      // now write some delayed events for p1, back tracking should find it
+      writeTaggedEvent(today.minusMinutes(1), PersistentRepr("e3", 3L, "p1", ""), Set("back-track"), 3, bucketSize)
+      writeTaggedEvent(today.minusMinutes(1), PersistentRepr("e4", 4L, "p1", ""), Set("back-track"), 4, bucketSize)
+      writeTaggedEvent(today.minusMinutes(1), PersistentRepr("e5", 5L, "p1", ""), Set("back-track"), 5, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 3L, "e3") => e }
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 4L, "e4") => e }
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 5L, "e5") => e }
+
+      // normal delivery should restart
+      writeTaggedEvent(PersistentRepr("e2", 2L, "p2", ""), Set("back-track"), 2, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p2", 2L, "e2") => e }
+      writeTaggedEvent(PersistentRepr("e6", 6L, "p1", ""), Set("back-track"), 6, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 6L, "e6") => e }
+    }
+
+    "work for for delayed events in the previous bucket via long period" in {
+      val t1 = today.minusDays(5)
+      val tagName = "back-track-previous-bucket"
+      writeTaggedEvent(t1, PersistentRepr("e1", 1L, "p1", ""), Set(tagName), 1, bucketSize)
+      writeTaggedEvent(t1.plusHours(1), PersistentRepr("e2", 2L, "p1", ""), Set(tagName), 2, bucketSize)
+
+      val src = queries.eventsByTag(tag = tagName, offset = NoOffset)
+      val probe = src.runWith(TestSink.probe[Any])
+      probe.request(10)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 1L, "e1") => e }
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 2L, "e2") => e }
+
+      // bring the offset forward with an event for a new persistence id
+      writeTaggedEvent(PersistentRepr("e1", 1L, "p2", ""), Set(tagName), 1, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p2", 1L, "e1") => e }
+
+      // now a delayed events for p1 in the previous bucket, further back than the short period
+      writeTaggedEvent(
+        today.minusDays(1).minusHours(1),
+        PersistentRepr("e3", 3L, "p1", ""),
+        Set(tagName),
+        3,
+        bucketSize)
+      // short interval should not pick it up
+      probe.expectNoMessage(2.second)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 3L, "e3") => e }
+
+      // normal delivery should restart
+      writeTaggedEvent(PersistentRepr("e2", 2L, "p2", ""), Set(tagName), 2, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p2", 2L, "e2") => e }
+    }
+
+    "find new persistence ids that were missed" in {
+      val tagName = "back-track-new-persistence-id"
+      val src = queries.eventsByTag(tag = tagName, offset = NoOffset)
+      val probe = src.runWith(TestSink.probe[Any])
+      probe.request(10)
+      writeTaggedEvent(PersistentRepr("e1", 1L, "p1", ""), Set(tagName), 1, bucketSize)
+      writeTaggedEvent(PersistentRepr("e2", 2L, "p1", ""), Set(tagName), 2, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 1L, "e1") => e }
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 2L, "e2") => e }
+
+      // now a delayed events for p2
+      writeTaggedEvent(today.minusMinutes(2), PersistentRepr("e1", 1L, "p2", ""), Set(tagName), 1, bucketSize)
+      writeTaggedEvent(today.minusMinutes(1), PersistentRepr("e2", 2L, "p2", ""), Set(tagName), 2, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p2", 1L, "e1") => e }
+      probe.expectNextPF { case e @ EventEnvelope(_, "p2", 2L, "e2") => e }
+
+      // normal delivery should restart
+      writeTaggedEvent(PersistentRepr("e3", 3L, "p1", ""), Set(tagName), 3, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 3L, "e3") => e }
+    }
+
+    "sort delayed events by timeuuid" in {
+      val tagName = "back-track-sort-delayed-events"
+      val src = queries.eventsByTag(tag = tagName, offset = NoOffset)
+      val probe = src.runWith(TestSink.probe[Any])
+      probe.request(10)
+      writeTaggedEvent(PersistentRepr("e1", 1L, "p1", ""), Set(tagName), 1, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 1L, "e1") => e }
+
+      // now a delayed events for p2 in the previous bucket and the current bucket
+      writeTaggedEvent(today.minusMinutes(4), PersistentRepr("e1", 1L, "p2", ""), Set(tagName), 1, bucketSize)
+      writeTaggedEvent(today.minusMinutes(2), PersistentRepr("e2", 2L, "p2", ""), Set(tagName), 2, bucketSize)
+
+      writeTaggedEvent(today.minusMinutes(3), PersistentRepr("e1", 1L, "p3", ""), Set(tagName), 1, bucketSize)
+      writeTaggedEvent(today.minusMinutes(1), PersistentRepr("e2", 2L, "p3", ""), Set(tagName), 2, bucketSize)
+
+      probe.expectNextPF { case e @ EventEnvelope(_, "p2", 1L, "e1") => e }
+      probe.expectNextPF { case e @ EventEnvelope(_, "p3", 1L, "e1") => e }
+      probe.expectNextPF { case e @ EventEnvelope(_, "p2", 2L, "e2") => e }
+      probe.expectNextPF { case e @ EventEnvelope(_, "p3", 2L, "e2") => e }
+
+      // normal delivery should restart
+      writeTaggedEvent(PersistentRepr("e2", 2L, "p1", ""), Set(tagName), 2, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "p1", 2L, "e2") => e }
+    }
+
+    "work for many delayed events for different persistence ids" in {
+      val tagName = "back-track-many-persistence-ids"
+      val src = queries.eventsByTag(tag = tagName, offset = NoOffset)
+      val probe = src.runWith(TestSink.probe[Any])
+      probe.request(1005)
+      // short period is 10m
+      val start = today.minusMinutes(9)
+      writeTaggedEvent(PersistentRepr("e1", 1L, "not-delayed", ""), Set(tagName), 1, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "not-delayed", 1L, "e1") => e }
+
+      val nrPids = 10
+      val nrEvents = 5
+      // all events for the same persistence id should come in order, but no deterministic order
+      // between persistence ids as they may be found in different searches
+      var currentSequenceNrs: Map[String, Long] = (1 to nrPids).map(i => (s"p$i", 0L)).toMap
+
+      (1 to nrPids).foreach { pid =>
+        (1 to nrEvents).foreach { event =>
+          writeTaggedEvent(
+            start.plusSeconds(event),
+            PersistentRepr(s"e$event", event, s"p$pid", ""),
+            Set(tagName),
+            event,
+            bucketSize)
+        }
+      }
+
+      (1 to (nrPids * nrEvents)).foreach { _ =>
+        val next = probe.expectNextPF { case e @ EventEnvelope(_, _, _, _) => e }
+        val expectedSequenceNr = currentSequenceNrs(next.persistenceId) + 1
+        withClue(
+          s"Expected sequence nr ${expectedSequenceNr} got ${next.sequenceNr} for persistence id ${next.persistenceId}") {
+          expectedSequenceNr shouldEqual next.sequenceNr
+          currentSequenceNrs = currentSequenceNrs.updated(next.persistenceId, next.sequenceNr)
+        }
+      }
+
+      // normal delivery should restart
+      writeTaggedEvent(PersistentRepr("e2", 2L, "not-delayed", ""), Set(tagName), 2, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "not-delayed", 2L, "e2") => e }
+
+      // do it all again
+      (1 to nrPids).foreach { pid =>
+        ((nrEvents + 1) to (nrEvents * 2)).foreach { event =>
+          writeTaggedEvent(
+            start.plusSeconds(event),
+            PersistentRepr(s"e$event", event, s"p$pid", ""),
+            Set(tagName),
+            event,
+            bucketSize)
+        }
+      }
+      (1 to (nrPids * nrEvents)).foreach { _ =>
+        val next = probe.expectNextPF { case e @ EventEnvelope(_, _, _, _) => e }
+        val expectedSequenceNr = currentSequenceNrs(next.persistenceId) + 1
+        withClue(
+          s"Expected sequence nr ${expectedSequenceNr} got ${next.sequenceNr} for persistence id ${next.persistenceId}") {
+          expectedSequenceNr shouldEqual next.sequenceNr
+          currentSequenceNrs = currentSequenceNrs.updated(next.persistenceId, next.sequenceNr)
+        }
+      }
+
+      // normal delivery should restart
+      writeTaggedEvent(PersistentRepr("e3", 3L, "not-delayed", ""), Set(tagName), 3, bucketSize)
+      probe.expectNextPF { case e @ EventEnvelope(_, "not-delayed", 3L, "e3") => e }
+    }
+  }
+
+  override protected val logCheck: PartialFunction[Any, Any] = {
+    case m: Warning if !m.message.toString.contains("eventual consistency set below 1 second") => m
+    case m: Logging.Error                                                                      => m
   }
 }
 
@@ -995,40 +1331,80 @@ object EventsByTagDisabledSpec {
   def props(pid: String): Props = Props(new CounterActor(pid))
 }
 
+class EventsByTagPersistenceIdCleanupSpec extends AbstractEventsByTagSpec(EventsByTagSpec.persistenceIdCleanupConfig) {
+
+  val newPersistenceIdScan: FiniteDuration = 500.millis
+  val cleanupPeriod: FiniteDuration = 1.second
+
+  val logFilters = Set("cleanup-old-persistence-ids has been set")
+
+  override protected val logCheck: PartialFunction[Any, Any] = {
+    case m: Warning if !logFilters.exists(exclude => m.message.toString.contains(exclude)) => m
+    case m: Logging.Error                                                                  => m
+  }
+
+  "PersistenceId cleanup" must {
+    "drop state and trigger new persistence id lookup peridodically" in {
+      val t1: LocalDateTime = LocalDateTime.now(ZoneOffset.UTC).minusDays(2)
+      val event1 = PersistentRepr(s"cleanup-1", 1, "cleanup")
+      writeTaggedEvent(t1, event1, Set("cleanup-tag"), 1, bucketSize)
+
+      val query =
+        queries.eventsByTag("cleanup-tag", TimeBasedUUID(Uuids.startOf(t1.toInstant(ZoneOffset.UTC).toEpochMilli - 1L)))
+      val probe = query.runWith(TestSink.probe[Any])
+      probe.request(10)
+      probe.expectNextPF { case e @ EventEnvelope(_, "cleanup", 1L, "cleanup-1") => e }
+      probe.expectNoMessage(cleanupPeriod + 250.millis)
+
+      // the metadata for pid cleanup should have been removed meaning the next event will be delayed
+      val event2 = PersistentRepr(s"cleanup-2", 2, "cleanup")
+      writeTaggedEvent(event2, Set("cleanup-tag"), 2, bucketSize)
+
+      probe.expectNoMessage(newPersistenceIdScan - 50.millis)
+      probe.expectNextPF { case e @ EventEnvelope(_, "cleanup", 2L, "cleanup-2") => e }
+
+    }
+  }
+
+}
+
 class EventsByTagDisabledSpec extends AbstractEventsByTagSpec(EventsByTagSpec.disabledConfig) {
 
   "Events by tag disabled" must {
     "stop tag_views being created" in {
-      session.getCluster.getMetadata.getKeyspace(journalName).getTable("tag_views") shouldEqual null
+      cluster.refreshSchema()
+      cluster.getMetadata.getKeyspace(journalName).get.getTable("tag_views") shouldEqual Optional.empty()
     }
 
     "stop tag_progress being created" in {
-      session.getCluster.getMetadata.getKeyspace(journalName).getTable("tag_write_progress") shouldEqual null
+      cluster.refreshSchema()
+      cluster.getMetadata.getKeyspace(journalName).get.getTable("tag_write_progress") shouldEqual Optional.empty()
     }
 
     "fail current events by tag queries" in {
       val greenSrc = queries.currentEventsByTag(tag = "green", offset = NoOffset)
       val probe = greenSrc.runWith(TestSink.probe[Any])
       probe.request(1)
-      probe.expectError().getMessage shouldEqual "Events by tag queries are disabled"
+      probe.expectError().getMessage should include("Events by tag queries are disabled")
     }
 
     "fail live events by tag queries" in {
       val greenSrc = queries.eventsByTag(tag = "green", offset = NoOffset)
       val probe = greenSrc.runWith(TestSink.probe[Any])
       probe.request(1)
-      probe.expectError().getMessage shouldEqual "Events by tag queries are disabled"
+      probe.expectError().getMessage should include("Events by tag queries are disabled")
     }
 
     "allow recovery" in {
+      val probe = TestProbe()
       val a = system.actorOf(EventsByTagDisabledSpec.props("a"))
-      a ! 2
-      expectMsg(20.seconds, 2)
+      a.tell(2, probe.ref)
+      probe.expectMsg(20.seconds, 2)
       a ! PoisonPill
 
       val aMk2 = system.actorOf(EventsByTagDisabledSpec.props("a"))
-      aMk2 ! 4
-      expectMsg(20.seconds, 6)
+      aMk2.tell(4, probe.ref)
+      probe.expectMsg(20.seconds, 6)
     }
   }
 }

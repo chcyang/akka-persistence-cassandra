@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
@@ -10,24 +10,31 @@ import java.util.UUID
 
 import akka.actor.ActorSystem
 import akka.persistence.PersistentRepr
+import akka.persistence.cassandra.BucketSize
+import akka.persistence.cassandra.EventsByTagSettings
+import akka.persistence.cassandra.PluginSettings
 import akka.persistence.cassandra.formatOffset
 import akka.persistence.cassandra.journal._
 import akka.serialization.Serialization
 import akka.serialization.Serializers
-import com.datastax.driver.core.Session
-import com.datastax.driver.core.utils.UUIDs
+import com.datastax.oss.driver.api.core.CqlSession
+import com.datastax.oss.driver.api.core.uuid.Uuids
 
 private[akka] trait TestTagWriter {
   def system: ActorSystem
-  val session: Session
+  def cluster: CqlSession
   val serialization: Serialization
-  val writePluginConfig: CassandraJournalConfig
+  val settings: PluginSettings
+  final def journalSettings: JournalSettings = settings.journalSettings
+  final def eventsByTagSettings: EventsByTagSettings = settings.eventsByTagSettings
 
   lazy val (preparedWriteTagMessage, preparedWriteTagMessageWithMeta) = {
-    val writeStatements: CassandraStatements = new CassandraStatements {
-      def config: CassandraJournalConfig = writePluginConfig
-    }
-    (session.prepare(writeStatements.writeTags(false)), session.prepare(writeStatements.writeTags(true)))
+    val writeStatements: CassandraJournalStatements = new CassandraJournalStatements(settings)
+    (cluster.prepare(writeStatements.writeTags(false)), cluster.prepare(writeStatements.writeTags(true)))
+  }
+
+  def clearAllEvents(): Unit = {
+    cluster.execute(s"truncate ${journalSettings.keyspace}.${eventsByTagSettings.tagTable.name}")
   }
 
   def writeTaggedEvent(
@@ -45,7 +52,7 @@ private[akka] trait TestTagWriter {
       tags: Set[String],
       tagPidSequenceNr: Long,
       bucketSize: BucketSize): Unit = {
-    val nowUuid = UUIDs.timeBased()
+    val nowUuid = Uuids.timeBased()
     write(persistent, tags, tagPidSequenceNr, nowUuid, bucketSize)
   }
 
@@ -66,28 +73,31 @@ private[akka] trait TestTagWriter {
     val event = pr.payload.asInstanceOf[AnyRef]
     val serializer = serialization.findSerializerFor(event)
     val serialized = ByteBuffer.wrap(serialization.serialize(event).get)
-
     val serManifest = Serializers.manifestFor(serializer, pr)
-
-    val timeBucket = TimeBucket(UUIDs.unixTimestamp(uuid), bucketSize)
-
-    val bs = preparedWriteTagMessage.bind()
+    val timeBucket = TimeBucket(Uuids.unixTimestamp(uuid), bucketSize)
 
     tags.foreach(tag => {
-      bs.setString("tag_name", tag)
-      bs.setLong("timebucket", timeBucket.key)
-      bs.setUUID("timestamp", uuid)
-      bs.setLong("tag_pid_sequence_nr", tagPidSequenceNr)
-      bs.setBytes("event", serialized)
-      bs.setString("event_manifest", pr.manifest)
-      bs.setString("persistence_id", pr.persistenceId)
-      bs.setInt("ser_id", serializer.identifier)
-      bs.setString("ser_manifest", serManifest)
-      bs.setString("writer_uuid", "ManualWrite")
-      bs.setLong("sequence_nr", pr.sequenceNr)
-      session.execute(bs)
+      val bs = preparedWriteTagMessage
+        .bind()
+        .setString("tag_name", tag)
+        .setLong("timebucket", timeBucket.key)
+        .setUuid("timestamp", uuid)
+        .setLong("tag_pid_sequence_nr", tagPidSequenceNr)
+        .setByteBuffer("event", serialized)
+        .setString("event_manifest", pr.manifest)
+        .setString("persistence_id", pr.persistenceId)
+        .setInt("ser_id", serializer.identifier)
+        .setString("ser_manifest", serManifest)
+        .setString("writer_uuid", "ManualWrite")
+        .setLong("sequence_nr", pr.sequenceNr)
+      cluster.execute(bs)
     })
 
-    system.log.debug("Written event: {} Uuid: {} Timebucket: {}", pr.payload, formatOffset(uuid), timeBucket)
+    system.log.debug(
+      "Written event: {} Uuid: {} Timebucket: {} TagPidSeqNr: {}",
+      pr.payload,
+      formatOffset(uuid),
+      timeBucket,
+      tagPidSequenceNr)
   }
 }

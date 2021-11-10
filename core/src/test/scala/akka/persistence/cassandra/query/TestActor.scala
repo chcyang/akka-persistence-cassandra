@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
@@ -9,11 +9,10 @@ import akka.actor.Props
 import akka.persistence.PersistentActor
 import akka.actor.ActorRef
 import akka.persistence.DeleteMessagesSuccess
-import akka.persistence.cassandra.EventWithMetaData
 import akka.persistence.journal.Tagged
 
 object TestActor {
-  def props(persistenceId: String, journalId: String = "cassandra-journal"): Props =
+  def props(persistenceId: String, journalId: String = "akka.persistence.cassandra.journal"): Props =
     Props(new TestActor(persistenceId, journalId))
 
   final case class PersistAll(events: immutable.Seq[String])
@@ -32,10 +31,6 @@ class TestActor(override val persistenceId: String, override val journalPluginId
     case cmd: String =>
       persist(cmd) { evt =>
         sender() ! evt + "-done"
-      }
-    case cmd: EventWithMetaData =>
-      persist(cmd) { evt =>
-        sender() ! s"$evt-done"
       }
     case cmd: Tagged =>
       persist(cmd) { evt =>

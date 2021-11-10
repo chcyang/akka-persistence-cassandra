@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.sharding
@@ -80,7 +80,7 @@ class ClusterShardingQuickTerminationSpec extends CassandraSpec("""
       }
       ClusterSharding(system).start(
         typeName = "tagging",
-        entityProps = Props[Counter],
+        entityProps = Props[Counter](),
         settings = ClusterShardingSettings(system),
         extractEntityId = extractEntityId,
         extractShardId = extractShardId)

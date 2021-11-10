@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query
@@ -9,49 +9,45 @@ import java.time.{ LocalDateTime, ZoneOffset }
 import akka.NotUsed
 import akka.actor.ActorRef
 import akka.persistence.PersistentRepr
-import akka.persistence.cassandra.journal.{ CassandraJournalConfig, Minute, TimeBucket }
-import akka.persistence.cassandra.{ CassandraLifecycle, CassandraSpec }
+import akka.persistence.cassandra.journal.TimeBucket
+import akka.persistence.cassandra.{ CassandraLifecycle, CassandraSpec, Minute }
 import akka.persistence.journal.Tagged
 import akka.persistence.query.scaladsl.EventsByTagQuery
-import akka.persistence.query.{ EventEnvelope, NoOffset, Offset }
+import akka.persistence.query.{ EventEnvelope, NoOffset }
 import akka.serialization.{ Serialization, SerializationExtension }
 import akka.stream.scaladsl.{ Keep, Source }
 import akka.stream.testkit.scaladsl.TestSink
 import akka.testkit.ImplicitSender
-import com.datastax.driver.core.utils.UUIDs
-import com.datastax.driver.core.Session
+import com.datastax.oss.driver.api.core.uuid.Uuids
 import com.typesafe.config.ConfigFactory
 import org.scalatest.BeforeAndAfterAll
-
-import scala.concurrent.Await
+import scala.annotation.tailrec
 import scala.concurrent.duration._
 
+import akka.persistence.cassandra.PluginSettings
+
 object EventsByTagStageSpec {
-  val today = LocalDateTime.now(ZoneOffset.UTC)
   val fetchSize = 3L
   val eventualConsistencyDelay: FiniteDuration = 400.millis
   val waitTime: FiniteDuration = (eventualConsistencyDelay * 1.5).asInstanceOf[FiniteDuration] // bigger than the eventual consistency delay but less than the new pid timeout
   val longWaitTime: FiniteDuration = waitTime * 2
-  val newPersistenceIdTimeout = 3 * longWaitTime // Give time for 2-3 long waits before a new persitenceId search gives up
+  val newPersistenceIdTimeout = 3 * longWaitTime // Give time for 2-3 long waits before a new persistenceId search gives up
   val config = ConfigFactory.parseString(s"""
-        akka.loglevel = DEBUG
-
         akka.actor.serialize-messages=on
 
-        cassandra-journal {
+        akka.persistence.cassandra {
           log-queries = off
-          events-by-tag {
-           flush-interval = 0ms
-           bucket-size = Minute
-          }
-        }
 
-        cassandra-query-journal {
-          first-time-bucket = "${today.minusMinutes(5).format(firstBucketFormatter)}"
-          max-result-size-query = $fetchSize
-          log-queries = on
-          refresh-interval = 200ms
+          query {
+            max-result-size-query = $fetchSize
+            log-queries = on
+            refresh-interval = 200ms
+          }
+          
           events-by-tag {
+            flush-interval = 0ms
+            bucket-size = Minute
+          
             # Speeds up tests
             eventual-consistency-delay = ${eventualConsistencyDelay.toMillis}ms
             gap-timeout = 5s
@@ -62,6 +58,7 @@ object EventsByTagStageSpec {
 
 }
 
+// Writes events directly to the tables rather than via the persistence API
 class EventsByTagStageSpec
     extends CassandraSpec(EventsByTagStageSpec.config)
     with BeforeAndAfterAll
@@ -70,19 +67,8 @@ class EventsByTagStageSpec
 
   import EventsByTagStageSpec._
 
-  val writePluginConfig = new CassandraJournalConfig(system, system.settings.config.getConfig("cassandra-journal"))
+  override val settings = PluginSettings(system)
   val serialization: Serialization = SerializationExtension(system)
-
-  lazy val session: Session = {
-    import system.dispatcher
-    Await.result(writePluginConfig.sessionProvider.connect(), 5.seconds)
-  }
-
-  override protected def afterAll(): Unit = {
-    session.close()
-    session.getCluster.close()
-    super.afterAll()
-  }
 
   private val bucketSize = Minute
 
@@ -200,7 +186,7 @@ class EventsByTagStageSpec
     "find missing event" in {
       val tag = "CurrentMissingEvent"
       val times = (1 to 5).map { _ =>
-        UUIDs.timeBased()
+        Uuids.timeBased()
       }
 
       writeTaggedEvent(PersistentRepr("p1e1", 1, "p-1"), Set(tag), 1, times(0), bucketSize)
@@ -231,7 +217,7 @@ class EventsByTagStageSpec
     "timeout looking for missing events" in {
       val tag = "CurrentMissingEventTimeout"
       val times = (1 to 5).map { _ =>
-        UUIDs.timeBased()
+        Uuids.timeBased()
       }
 
       writeTaggedEvent(PersistentRepr("p1e1", 1, "p-1"), Set(tag), 1, times(0), bucketSize)
@@ -248,8 +234,7 @@ class EventsByTagStageSpec
       sub.expectNextPF { case EventEnvelope(_, "p-2", 1, "p2e1") => }
       sub.expectNoMessage(longWaitTime)
 
-      sub.expectError().getMessage should equal(s"Unable to find missing tagged event: " +
-      s"PersistenceId: p-1. Tag: $tag. MissingTagPidSequenceNrs: Set(3). Previous offset: ${Offset.timeBasedUUID(times(1))}")
+      sub.expectError().getMessage should startWith("Unable to find tagged event")
     }
 
     "find multiple missing messages that span time buckets" in {
@@ -389,7 +374,7 @@ class EventsByTagStageSpec
     "find missing event" in {
       val tag = "LiveMissingEvent"
       val times = (1 to 5).map { _ =>
-        UUIDs.timeBased()
+        Uuids.timeBased()
       }
       writeTaggedEvent(PersistentRepr("p1e1", 1, "p-1"), Set(tag), 1, times(0), bucketSize)
       writeTaggedEvent(PersistentRepr("p1e2", 2, "p-1"), Set(tag), 2, times(1), bucketSize)
@@ -418,7 +403,7 @@ class EventsByTagStageSpec
     "find multiple missing events" in {
       val tag = "LiveMultipleMissingEvent"
       val times = (1 to 7).map { _ =>
-        UUIDs.timeBased()
+        Uuids.timeBased()
       }
       writeTaggedEvent(PersistentRepr("p1e1", 1, "p-1"), Set(tag), 1, times(0), bucketSize)
       writeTaggedEvent(PersistentRepr("p1e2", 2, "p-1"), Set(tag), 2, times(1), bucketSize)
@@ -454,7 +439,7 @@ class EventsByTagStageSpec
     "find missing first event" in {
       val tag = "LiveMissingFirstEvent"
       val times = (1 to 5).map { _ =>
-        UUIDs.timeBased()
+        Uuids.timeBased()
       }
       writeTaggedEvent(PersistentRepr("p1e1", 1, "p-1"), Set(tag), 1, times(0), bucketSize)
       writeTaggedEvent(PersistentRepr("p2e3", 3, "p-2"), Set(tag), 3, times(3), bucketSize)
@@ -476,7 +461,7 @@ class EventsByTagStageSpec
       sub.expectNextPF { case EventEnvelope(_, "p-2", 3, "p2e3") => }
 
       writeTaggedEvent(PersistentRepr("p2e4", 4, "p-2"), Set(tag), 4, times(4), bucketSize)
-      writeTaggedEvent(PersistentRepr("p2e5", 5, "p-2"), Set(tag), 5, UUIDs.timeBased(), bucketSize)
+      writeTaggedEvent(PersistentRepr("p2e5", 5, "p-2"), Set(tag), 5, Uuids.timeBased(), bucketSize)
       sub.expectNextPF { case EventEnvelope(_, "p-2", 4, "p2e4") => }
       sub.expectNextPF { case EventEnvelope(_, "p-2", 5, "p2e5") => }
 
@@ -506,7 +491,7 @@ class EventsByTagStageSpec
       val tag = "LiveMissingEventsInPreviousBucket"
       val nowTime = LocalDateTime.now(ZoneOffset.UTC)
       val twoBucketsAgo = nowTime.minusMinutes(2)
-      val lastBucket = nowTime.minusMinutes(1)
+      val lastBucket: LocalDateTime = nowTime.minusMinutes(1)
       val thisBucket = nowTime
 
       writeTaggedEvent(twoBucketsAgo, PersistentRepr("p1e1", 1, "p-1"), Set(tag), 1, bucketSize)
@@ -547,12 +532,29 @@ class EventsByTagStageSpec
       sub.expectNoMessage(100.millis)
       writeTaggedEvent(nowTime, PersistentRepr("p1e11", 11, "p-1"), Set(tag), 11, bucketSize)
       // wait more than the new persistence id timeout but less than the gap-timeout
-      sub.expectNextWithTimeoutPF(2.seconds, { case EventEnvelope(_, "p-1", 11, "p1e11") => })
+      sub.expectNextWithTimeoutPF(newPersistenceIdTimeout * 1.1, { case EventEnvelope(_, "p-1", 11, "p1e11") => })
+
+      // add more events to check that the periodic poll still works
+      writeTaggedEvent(LocalDateTime.now(ZoneOffset.UTC), PersistentRepr("p1e12", 12, "p-1"), Set(tag), 12, bucketSize)
+      sub.expectNextPF { case EventEnvelope(_, "p-1", 12, "p1e12") => }
       sub.cancel()
+    }
+
+    "fail quickly if large number of missing events" in {
+      val tag = "LargeNumberMissing"
+      val nowTime = LocalDateTime.now(ZoneOffset.UTC)
+      writeTaggedEvent(nowTime.plusSeconds(1), PersistentRepr("p1e1", 1, "p1"), Set(tag), 1, bucketSize)
+      val tagStream = queries.eventsByTag(tag, NoOffset)
+      val sub = tagStream.runWith(TestSink.probe[EventEnvelope])
+      sub.request(2)
+      sub.expectNextPF { case EventEnvelope(_, "p1", 1, "p1e1") => }
+      writeTaggedEvent(nowTime.plusSeconds(2), PersistentRepr("p1e10000", 10000, "p1"), Set(tag), 10000, bucketSize)
+      sub.expectError().getMessage() shouldEqual s"9998 missing tagged events for tag [$tag]. Failing without search"
     }
   }
 
   private def currentAndPreviousBucket(): (LocalDateTime, LocalDateTime) = {
+    @tailrec
     def nowTime(): LocalDateTime = {
       val now = LocalDateTime.now(ZoneOffset.UTC)
       // If too close to the end of bucket the query might span 3 buckets and events by tag only goes

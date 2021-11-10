@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.journal
@@ -10,12 +10,10 @@ import com.typesafe.config.ConfigFactory
 
 object TagScanningSpec {
   val config = ConfigFactory.parseString(s"""
-      akka.loglevel = INFO
-      cassandra-journal.events-by-tag.enabled = on
-      cassandra-journal.events-by-tag.scanning-flush-interval = 2s
-      cassandra-journal.replay-filter.mode = off
-      cassandra-journal.log-queries = off
-      cassandra-snapshot-store.log-queries = off
+      akka.persistence.cassandra.events-by-tag.enabled = on
+      akka.persistence.cassandra.events-by-tag.scanning-flush-interval = 2s
+      akka.persistence.cassandra.journal.replay-filter.mode = off
+      akka.persistence.cassandra.log-queries = off
     """).withFallback(CassandraLifecycle.config)
 }
 
@@ -30,15 +28,15 @@ class TagScanningSpec extends CassandraSpec(TagScanningSpec.config) {
       }
 
       awaitAssert {
-        import scala.collection.JavaConverters._
+        import scala.jdk.CollectionConverters._
         val expected = (0 until nrActors).map(n => (s"$n".toInt, 1L)).toList
-        val scanning = journalSession
-          .execute("select * from tag_scanning")
+        val scanning = cluster
+          .execute(s"select * from ${journalName}.tag_scanning")
           .all()
           .asScala
           .toList
           .map(row => (row.getString("persistence_id"), row.getLong("sequence_nr")))
-          .filterNot(_._1 == "persistenceInit")
+          .filterNot(_._1.startsWith("persistenceInit"))
           .map { case (pid, seqNr) => (pid.toInt, seqNr) } // sorting by pid makes the failure message easy to interpret
           .sortBy(_._1)
         scanning shouldEqual expected

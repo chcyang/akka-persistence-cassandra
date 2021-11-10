@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query.javadsl
@@ -16,12 +16,12 @@ import scala.concurrent.duration._
 object CassandraReadJournalSpec {
   val config = ConfigFactory.parseString(s"""
     akka.actor.serialize-messages=off
-    cassandra-query-journal.max-buffer-size = 10
-    cassandra-query-journal.refresh-interval = 0.5s
-    cassandra-journal.event-adapters {
+    akka.persistence.cassandra.query.max-buffer-size = 10
+    akka.persistence.cassandra.query.refresh-interval = 0.5s
+    akka.persistence.cassandra.journal.event-adapters {
       test-tagger = akka.persistence.cassandra.query.javadsl.TestTagger
     }
-    cassandra-journal.event-adapter-bindings = {
+    akka.persistence.cassandra.journal.event-adapter-bindings = {
       "java.lang.String" = test-tagger
     }
     """).withFallback(CassandraLifecycle.config)

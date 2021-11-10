@@ -1,27 +1,30 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.journal
 
 import java.util.UUID
 
-import akka.actor.{ Actor, ActorLogging, ActorRef, NoSerializationVerificationNeeded, Props, Timers }
+import akka.Done
+import akka.actor.{ Actor, ActorLogging, ActorRef, NoSerializationVerificationNeeded, Props, ReceiveTimeout, Timers }
 import akka.annotation.InternalApi
 import akka.cluster.pubsub.{ DistributedPubSub, DistributedPubSubMediator }
+import akka.event.LoggingAdapter
 import akka.pattern.pipe
 import akka.persistence.cassandra.formatOffset
 import akka.persistence.cassandra.journal.CassandraJournal._
 import akka.persistence.cassandra.journal.TagWriter.TagWriterSettings
 import akka.persistence.cassandra.journal.TagWriters.TagWritersSession
-import akka.persistence.cassandra.query.UUIDComparator
+import akka.util.{ OptionVal, UUIDComparator }
 
-import scala.concurrent.duration.{ Duration, FiniteDuration }
+import scala.concurrent.duration.{ Duration, FiniteDuration, _ }
 import scala.util.control.NonFatal
 import scala.util.{ Failure, Success, Try }
-import scala.concurrent.duration._
 
 /*
+ * INTERNAL API
+ *
  * Groups writes into un-logged batches for the same partition.
  *
  * For the read stage to work correctly events must be written in order for a given
@@ -35,14 +38,15 @@ import scala.concurrent.duration._
  */
 @InternalApi private[akka] object TagWriter {
 
-  private[akka] def props(settings: TagWriterSettings, session: TagWritersSession, tag: Tag): Props =
-    Props(new TagWriter(settings, session, tag))
+  private[akka] def props(settings: TagWriterSettings, session: TagWritersSession, tag: Tag, parent: ActorRef): Props =
+    Props(new TagWriter(settings, session, tag, parent))
 
   private[akka] case class TagWriterSettings(
       maxBatchSize: Int,
       flushInterval: FiniteDuration,
       scanningFlushInterval: FiniteDuration,
-      pubsubNotification: Boolean)
+      stopTagWriterWhenIdle: FiniteDuration,
+      pubsubNotification: Duration)
 
   private[akka] case class TagProgress(
       persistenceId: PersistenceId,
@@ -63,24 +67,46 @@ import scala.concurrent.duration._
   private[akka] case object Flush
   private[akka] case object FlushComplete
 
+  // The "passivate pattern" is used to avoid loosing messages between TagWriters (parent)
+  // and TagWriter when the TagWriter is stopped due to inactivity.
+  // When idle for longer than configured stopTagWriterWhenIdle the TagWriter sends `PassivateTagWriter` to parent,
+  // which replies with `StopTagWriter` and starts buffering incoming messages for the tag.
+  // The TagWriter stops when receiving StopTagWriter if it is still ok to passivate (no state, nothing in progress).
+  // TagWriters (parent) sends buffered messages if any when the TagWriter has been terminated.
+  private[akka] final case class PassivateTagWriter(tag: String)
+  private[akka] final case class CancelPassivateTagWriter(tag: String)
+  private[akka] case object StopTagWriter
+
   type TagWriteSummary = Map[PersistenceId, PidProgress]
   case class PidProgress(seqNrFrom: SequenceNr, seqNrTo: SequenceNr, tagPidSequenceNr: TagPidSequenceNr, offset: UUID)
   private case object InternalFlush
   private case object FlushKey
   sealed trait TagWriteFinished
   final case class TagWriteDone(summary: TagWriteSummary, doneNotify: Option[ActorRef]) extends TagWriteFinished
-  private final case class TagWriteFailed(reason: Throwable, failedEvents: Vector[(Serialized, TagPidSequenceNr)])
+  private final case class TagWriteFailed(reason: Throwable, failedEvents: Vector[AwaitingWrite])
       extends TagWriteFinished
 
   private[akka] case class DropState(pid: PersistenceId)
 
-  val timeUuidOrdering = new Ordering[UUID] {
+  val timeUuidOrdering: Ordering[UUID] = new Ordering[UUID] {
     override def compare(x: UUID, y: UUID) =
       UUIDComparator.comparator.compare(x, y)
   }
+
+  /**
+   * The only reason ack is None is if a TagWrite needed to be broken up because the events were
+   * from different time buckets or if a single write exceeds the batch size.
+   * In that case the later AwaitingWrite contains the ack.
+   */
+  case class AwaitingWrite(events: Seq[(Serialized, TagPidSequenceNr)], ack: OptionVal[ActorRef])
 }
 
-@InternalApi private[akka] class TagWriter(settings: TagWriterSettings, session: TagWritersSession, tag: String)
+/** INTERNAL API */
+@InternalApi private[akka] class TagWriter(
+    settings: TagWriterSettings,
+    session: TagWritersSession,
+    tag: String,
+    parent: ActorRef)
     extends Actor
     with Timers
     with ActorLogging
@@ -88,83 +114,92 @@ import scala.concurrent.duration._
 
   import TagWriter._
   import TagWriters.TagWrite
-  import context.become
-  import context.dispatcher
+  import context.{ become, dispatcher }
 
   // eager init and val because used from Future callbacks
-  override val log = super.log
+  override val log: LoggingAdapter = super.log
 
-  private val pubsub: Option[DistributedPubSub] =
-    if (settings.pubsubNotification) {
-      Try {
-        DistributedPubSub(context.system)
-      }.toOption
-    } else {
-      None
+  private val pubsub: Option[ActorRef] = {
+    settings.pubsubNotification match {
+      case interval: FiniteDuration =>
+        Try {
+          context.actorOf(PubSubThrottler.props(DistributedPubSub(context.system).mediator, interval))
+        }.toOption
+      case _ =>
+        None
     }
-
-  private val parent = context.parent
+  }
 
   var lastLoggedBufferNs: Long = -1
   val bufferWarningMinDurationNs: Long = 5.seconds.toNanos
 
-  override def preStart(): Unit =
+  override def preStart(): Unit = {
     log.debug("Running TagWriter for [{}] with settings {}", tag, settings)
+    if (settings.stopTagWriterWhenIdle > Duration.Zero)
+      context.setReceiveTimeout(settings.stopTagWriterWhenIdle)
+  }
 
   override def receive: Receive =
-    idle(Vector.empty[(Serialized, TagPidSequenceNr)], Map.empty[String, Long])
+    idle(Buffer.empty(settings.maxBatchSize), Map.empty[String, Long])
 
-  private def idle(
-      buffer: Vector[(Serialized, TagPidSequenceNr)],
-      tagPidSequenceNrs: Map[PersistenceId, TagPidSequenceNr]): Receive = {
+  private def idle(buffer: Buffer, tagPidSequenceNrs: Map[PersistenceId, TagPidSequenceNr]): Receive = {
     case DropState(pid) =>
       log.debug("Dropping state for pid: {}", pid)
-      context.become(idle(buffer, tagPidSequenceNrs - pid))
+      context.become(idle(buffer.remove(pid), tagPidSequenceNrs - pid))
     case InternalFlush =>
       log.debug("Flushing")
       if (buffer.nonEmpty) {
-        write(buffer.take(settings.maxBatchSize), buffer.drop(settings.maxBatchSize), tagPidSequenceNrs, None)
+        write(buffer, tagPidSequenceNrs, None)
       }
     case Flush =>
       if (buffer.nonEmpty) {
-        // FIXME, this should br broken into batches https://github.com/akka/akka-persistence-cassandra/issues/405
         log.debug("External flush request from [{}]. Flushing.", sender())
-        write(buffer, Vector.empty[(Serialized, TagPidSequenceNr)], tagPidSequenceNrs, Some(sender()))
+        write(buffer, tagPidSequenceNrs, Some(sender()))
       } else {
         log.debug("External flush request from [{}], buffer empty.", sender())
         sender() ! FlushComplete
       }
-    case TagWrite(_, payload) =>
-      // FIXME, keeping this sorted is over kill. We only need to know if a new timebucket is
-      // reached to force a flush or that the batch size is met
-      val (newTagPidSequenceNrs, events) =
+    case TagWrite(_, payload, _) =>
+      val (newTagPidSequenceNrs, events: Seq[(Serialized, TagPidSequenceNr)]) = {
         assignTagPidSequenceNumbers(payload.toVector, tagPidSequenceNrs)
-      log.debug("Assigned tag pid sequence nrs: {}", events)
-      val newBuffer = (buffer ++ events).sortBy(_._1.timeUuid)(timeUuidOrdering)
+      }
+      val newWrite = AwaitingWrite(events, OptionVal(sender()))
+      val newBuffer = buffer.add(newWrite)
       flushIfRequired(newBuffer, newTagPidSequenceNrs)
     case twd: TagWriteDone =>
       log.error("Received Done when in idle state. This is a bug. Please report with DEBUG logs: {}", twd)
     case ResetPersistenceId(_, tp @ TagProgress(pid, _, tagPidSequenceNr)) =>
       log.debug("Resetting pid {}. TagProgress {}", pid, tp)
-      become(idle(buffer.filterNot(_._1.persistenceId == pid), tagPidSequenceNrs + (pid -> tagPidSequenceNr)))
+      become(idle(buffer.remove(pid), tagPidSequenceNrs + (pid -> tagPidSequenceNr)))
       sender() ! ResetPersistenceIdComplete
+
+    case ReceiveTimeout =>
+      if (buffer.isEmpty && tagPidSequenceNrs.isEmpty)
+        parent ! PassivateTagWriter(tag)
+
+    case StopTagWriter =>
+      if (buffer.isEmpty && tagPidSequenceNrs.isEmpty)
+        context.stop(self)
+      else
+        parent ! CancelPassivateTagWriter(tag)
   }
 
   private def writeInProgress(
-      buffer: Vector[(Serialized, TagPidSequenceNr)],
+      buffer: Buffer,
       tagPidSequenceNrs: Map[PersistenceId, TagPidSequenceNr],
       awaitingFlush: Option[ActorRef]): Receive = {
     case DropState(pid) =>
       log.debug("Dropping state for pid: [{}]", pid)
-      become(writeInProgress(buffer, tagPidSequenceNrs - pid, awaitingFlush))
+      become(writeInProgress(buffer.remove(pid), tagPidSequenceNrs - pid, awaitingFlush))
     case InternalFlush =>
     // Ignore, we will check when the write is done
     case Flush =>
       log.debug("External flush while write in progress. Will flush after write complete")
       become(writeInProgress(buffer, tagPidSequenceNrs, Some(sender())))
-    case TagWrite(_, payload) =>
+    case TagWrite(_, payload, _) =>
       val (updatedTagPidSequenceNrs, events) =
         assignTagPidSequenceNumbers(payload.toVector, tagPidSequenceNrs)
+      val awaitingWrite = AwaitingWrite(events, OptionVal(sender()))
       val now = System.nanoTime()
       if (buffer.size > (4 * settings.maxBatchSize) && now > (lastLoggedBufferNs + bufferWarningMinDurationNs)) {
         lastLoggedBufferNs = now
@@ -172,14 +207,21 @@ import scala.concurrent.duration._
           "Buffer for tagged events is getting too large ({}), is Cassandra responsive? Are writes failing? " +
           "If events are buffered for longer than the eventual-consistency-delay they won't be picked up by live queries. The oldest event in the buffer is offset: {}",
           buffer.size,
-          formatOffset(buffer.head._1.timeUuid))
+          formatOffset(buffer.nextBatch.head.events.head._1.timeUuid))
       }
       // buffer until current query is finished
       // Don't sort until the write has finished
-      become(writeInProgress(buffer ++ events, updatedTagPidSequenceNrs, awaitingFlush))
+      val newBuffer = buffer.addPending(awaitingWrite)
+      become(writeInProgress(newBuffer, updatedTagPidSequenceNrs, awaitingFlush))
     case TagWriteDone(summary, doneNotify) =>
-      val sortedBuffer = buffer.sortBy(_._1.timeUuid)(timeUuidOrdering)
       log.debug("Tag write done: {}", summary)
+      val nextBuffer = buffer.writeComplete()
+      buffer.nextBatch.foreach { write =>
+        write.ack match {
+          case OptionVal.None      =>
+          case OptionVal.Some(ref) => ref ! Done
+        }
+      }
       summary.foreach {
         case (id, PidProgress(_, seqNrTo, tagPidSequenceNr, offset)) =>
           // These writes do not block future writes. We don't read the tag progress again from C*
@@ -199,23 +241,19 @@ import scala.concurrent.duration._
               parent ! TagWriters.TagWriteFailed(t)
           }
       }
-      log.debug(s"Tag write complete. {}", summary)
       awaitingFlush match {
         case Some(replyTo) =>
           log.debug("External flush request")
-          if (sortedBuffer.nonEmpty) {
-            // FIXME, break into batches
-            write(sortedBuffer, Vector.empty[(Serialized, TagPidSequenceNr)], tagPidSequenceNrs, awaitingFlush)
+          if (buffer.pending.nonEmpty) {
+            write(nextBuffer, tagPidSequenceNrs, awaitingFlush)
           } else {
             replyTo ! FlushComplete
-            context.become(idle(sortedBuffer, tagPidSequenceNrs))
+            context.become(idle(nextBuffer, tagPidSequenceNrs))
           }
         case None =>
-          flushIfRequired(sortedBuffer, tagPidSequenceNrs)
+          flushIfRequired(nextBuffer, tagPidSequenceNrs)
       }
-      pubsub.foreach {
-        _.mediator ! DistributedPubSubMediator.Publish("akka.persistence.cassandra.journal.tag", tag)
-      }
+      sendPubsubNotification()
       doneNotify.foreach(_ ! FlushComplete)
 
     case TagWriteFailed(t, events) =>
@@ -225,48 +263,38 @@ import scala.concurrent.duration._
         t)
       timers.startSingleTimer(FlushKey, InternalFlush, settings.flushInterval)
       parent ! TagWriters.TagWriteFailed(t)
-      context.become(idle(events ++ buffer, tagPidSequenceNrs))
+      context.become(idle(buffer, tagPidSequenceNrs))
 
     case ResetPersistenceId(_, tp @ TagProgress(pid, _, _)) =>
       log.debug("Resetting persistence id {}. TagProgress {}", pid, tp)
-      become(
-        writeInProgress(
-          buffer.filterNot(_._1.persistenceId == pid),
-          tagPidSequenceNrs + (pid -> tp.pidTagSequenceNr),
-          awaitingFlush))
+      become(writeInProgress(buffer.remove(pid), tagPidSequenceNrs + (pid -> tp.pidTagSequenceNr), awaitingFlush))
       sender() ! ResetPersistenceIdComplete
+
+    case ReceiveTimeout =>
+    // not idle
+
+    case StopTagWriter =>
+      // not idle any more
+      parent ! CancelPassivateTagWriter(tag)
   }
 
-  private def flushIfRequired(buffer: Vector[(Serialized, TagPidSequenceNr)], tagSequenceNrs: Map[String, Long]): Unit =
+  private def sendPubsubNotification(): Unit = {
+    pubsub.foreach {
+      _ ! DistributedPubSubMediator.Publish(s"apc.tags.$tag", tag)
+    }
+  }
+
+  private def flushIfRequired(buffer: Buffer, tagSequenceNrs: Map[String, Long]): Unit = {
     if (buffer.isEmpty) {
       context.become(idle(buffer, tagSequenceNrs))
-    } else if (buffer.head._1.timeBucket < buffer.last._1.timeBucket) {
-      val (currentBucket, rest) =
-        buffer.span(_._1.timeBucket == buffer.head._1.timeBucket)
-      if (log.isDebugEnabled) {
-        log.debug(
-          "Switching time buckets: head: {} last: {}. Number in current bucket: {}",
-          buffer.head._1.timeBucket,
-          buffer.last._1.timeBucket,
-          currentBucket.size)
-      }
-
-      if (currentBucket.size > settings.maxBatchSize) {
-        write(buffer.take(settings.maxBatchSize), buffer.drop(settings.maxBatchSize), tagSequenceNrs, None)
-      } else {
-        write(currentBucket, rest, tagSequenceNrs, None)
-      }
-    } else if (buffer.size >= settings.maxBatchSize) {
-      log.debug("Batch size reached. Writing to Cassandra.")
-      write(buffer.take(settings.maxBatchSize), buffer.drop(settings.maxBatchSize), tagSequenceNrs, None)
-    } else if (settings.flushInterval == Duration.Zero) {
-      log.debug("Flushing right away as interval is zero")
-      // Should always be a buffer of 1
-      write(buffer, Vector.empty[(Serialized, TagPidSequenceNr)], tagSequenceNrs, None)
+    } else if (buffer.shouldWrite() || settings.flushInterval == Duration.Zero) {
+      write(buffer, tagSequenceNrs, None)
     } else {
-      timers.startSingleTimer(FlushKey, InternalFlush, settings.flushInterval)
+      if (!timers.isTimerActive(FlushKey))
+        timers.startSingleTimer(FlushKey, InternalFlush, settings.flushInterval)
       context.become(idle(buffer, tagSequenceNrs))
     }
+  }
 
   /**
    * Defaults to 1 as if recovery for a persistent Actor based its recovery
@@ -288,42 +316,46 @@ import scala.concurrent.duration._
    * Events should be ordered by sequence nr per pid
    */
   private def write(
-      events: Vector[(Serialized, TagPidSequenceNr)],
-      remainingBuffer: Vector[(Serialized, TagPidSequenceNr)],
+      buffer: Buffer,
       tagPidSequenceNrs: Map[String, TagPidSequenceNr],
       notifyWhenDone: Option[ActorRef]): Unit = {
-    val writeSummary = createTagWriteSummary(events)
-    log.debug("Starting tag write of {} events. Summary: {}", events.size, writeSummary)
-    val withFailure = session.writeBatch(tag, events).map(_ => TagWriteDone(writeSummary, notifyWhenDone)).recover {
+    val writeSummary = createTagWriteSummary(buffer)
+    log.debug("Starting tag write of {} events. Summary: {}", buffer.nextBatch.size, writeSummary)
+    val withFailure = session.writeBatch(tag, buffer).map(_ => TagWriteDone(writeSummary, notifyWhenDone)).recover {
       case NonFatal(t) =>
-        TagWriteFailed(t, events)
+        TagWriteFailed(t, buffer.nextBatch)
     }
 
     import context.dispatcher
     withFailure.pipeTo(self)
 
     // notifyWhenDone is cleared out as it is now in the TagWriteDone
-    context.become(writeInProgress(remainingBuffer, tagPidSequenceNrs, None))
+    context.become(writeInProgress(buffer, tagPidSequenceNrs, None))
   }
 
-  private def createTagWriteSummary(writes: Seq[(Serialized, TagPidSequenceNr)]): Map[PersistenceId, PidProgress] =
-    writes.foldLeft(Map.empty[PersistenceId, PidProgress])((acc, next) => {
-      val (event, tagPidSequenceNr) = next
-      acc.get(event.persistenceId) match {
-        case Some(PidProgress(from, to, _, _)) =>
-          if (event.sequenceNr <= to)
-            throw new IllegalStateException(
-              s"Expected events to be ordered by seqNr. ${event.persistenceId} " +
-              s"Events: ${writes.map(e => (e._1.persistenceId, e._1.sequenceNr, e._1.timeUuid))}")
-          acc + (event.persistenceId -> PidProgress(from, event.sequenceNr, tagPidSequenceNr, event.timeUuid))
-        case None =>
-          acc + (event.persistenceId -> PidProgress(
-            event.sequenceNr,
-            event.sequenceNr,
-            tagPidSequenceNr,
-            event.timeUuid))
-      }
-    })
+  private def createTagWriteSummary(writes: Buffer): Map[PersistenceId, PidProgress] = {
+    writes.nextBatch
+      .flatten(_.events)
+      .foldLeft(Map.empty[PersistenceId, PidProgress])((acc, next) => {
+        val (event, tagPidSequenceNr) = next
+        acc.get(event.persistenceId) match {
+          case Some(PidProgress(from, to, _, _)) =>
+            if (event.sequenceNr <= to)
+              throw new IllegalStateException(
+                s"Expected events to be ordered by seqNr. ${event.persistenceId} " +
+                s"Events: ${writes.nextBatch.map(e =>
+                  (e.events.head._1.persistenceId, e.events.head._1.sequenceNr, e.events.head._1.timeUuid))}")
+
+            acc + (event.persistenceId -> PidProgress(from, event.sequenceNr, tagPidSequenceNr, event.timeUuid))
+          case None =>
+            acc + (event.persistenceId -> PidProgress(
+              event.sequenceNr,
+              event.sequenceNr,
+              tagPidSequenceNr,
+              event.timeUuid))
+        }
+      })
+  }
 
   private def assignTagPidSequenceNumbers(
       events: Vector[Serialized],

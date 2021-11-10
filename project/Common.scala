@@ -1,9 +1,8 @@
+import bintray.BintrayPlugin.autoImport._
+import com.lightbend.paradox.projectinfo.ParadoxProjectInfoPluginKeys._
 import de.heikoseeberger.sbtheader.HeaderPlugin.autoImport._
 import de.heikoseeberger.sbtheader._
 import org.scalafmt.sbt.ScalafmtPlugin.autoImport._
-import xerial.sbt.Sonatype.autoImport._
-import sbtdynver.DynVerPlugin.autoImport._
-import io.crashbox.gpg.SbtGpg.autoImport._
 import sbt.Keys._
 import sbt._
 import sbt.plugins.JvmPlugin
@@ -21,7 +20,7 @@ object Common extends AutoPlugin {
       organizationHomepage := Some(url("https://www.lightbend.com/")),
       startYear := Some(2016),
       homepage := Some(url("https://akka.io")),
-      apiURL := Some(url(s"https://doc.akka.io/api/akka-persistence-cassandra/${version.value}")),
+      // apiURL defined in projectSettings because version.value is not correct here
       scmInfo := Some(
           ScmInfo(
             url("https://github.com/akka/akka-persistence-cassandra"),
@@ -35,23 +34,11 @@ object Common extends AutoPlugin {
       description := "A Cassandra plugin for Akka Persistence.")
 
   override lazy val projectSettings = Seq(
-    //      projectInfoVersion := (if (isSnapshot.value) "snapshot" else version.value),
+    projectInfoVersion := (if (isSnapshot.value) "snapshot" else version.value),
     crossVersion := CrossVersion.binary,
     crossScalaVersions := Dependencies.ScalaVersions,
     scalaVersion := Dependencies.Scala212,
     scalacOptions ++= Seq("-encoding", "UTF-8", "-feature", "-unchecked", "-Xlint", "-Ywarn-dead-code", "-deprecation"),
-    scalacOptions ++= {
-      // define scalac options that are only valid or desirable for 2.12
-      if (scalaVersion.value.startsWith("2.13"))
-        Seq()
-      else
-        Seq(
-          // -deprecation causes some warnings on 2.13 because of collection converters.
-          // We only enable `fatal-warnings` on 2.12 and accept the warning on 2.13
-          "-Xfatal-warnings",
-          "-Xfuture" // invalid in 2.13
-        )
-    },
     Compile / console / scalacOptions --= Seq("-deprecation", "-Xfatal-warnings", "-Xlint", "-Ywarn-unused:imports"),
     Compile / doc / scalacOptions := scalacOptions.value ++ Seq(
         "-doc-title",
@@ -62,25 +49,28 @@ object Common extends AutoPlugin {
         (baseDirectory in ThisBuild).value.toString,
         "-doc-source-url", {
           val branch = if (isSnapshot.value) "master" else s"v${version.value}"
-          s"https://github.com/akka/akka-persistence-cassandra/tree/${branch}€{FILE_PATH}.scala#L1"
+          s"https://github.com/akka/akka-persistence-cassandra/tree/${branch}€{FILE_PATH_EXT}#L€{FILE_LINE}"
         },
+        "-doc-canonical-base-url",
+        "https://doc.akka.io/api/akka-persistence-cassandra/current/",
         "-skip-packages",
         "akka.pattern" // for some reason Scaladoc creates this
       ),
     Compile / doc / scalacOptions --= Seq("-Xfatal-warnings"),
     scalafmtOnCompile := true,
     autoAPIMappings := true,
+    apiURL := Some(url(s"https://doc.akka.io/api/akka-persistence-cassandra/${projectInfoVersion.value}")),
     headerLicense := Some(
-        HeaderLicense.Custom("""Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>""")),
+        HeaderLicense.Custom("""Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>""")),
     Test / logBuffered := System.getProperty("akka.logBufferedTests", "false").toBoolean,
     // show full stack traces and test case durations
-    Test / testOptions += Tests.Argument("-oDF"),
+    Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-oDF"),
     // -a Show stack traces and exception class name for AssertionErrors.
     // -v Log "test run started" / "test started" / "test run finished" events on log level "info" instead of "debug".
     // -q Suppress stdout for successful tests.
     Test / testOptions += Tests.Argument(TestFrameworks.JUnit, "-a", "-v", "-q"),
     Test / parallelExecution := false,
-    publishTo := sonatypePublishTo.value,
-    sonatypeProfileName := "com.lightbend",
-    gpgKey := Some("4704549B8310E30C64805EFB7A4A132FB335FFFE"))
+    bintrayOrganization := Some("akka"),
+    bintrayPackage := "akka-persistence-cassandra",
+    bintrayRepository := (if (isSnapshot.value) "snapshots" else "maven"))
 }

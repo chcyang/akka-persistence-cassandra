@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.journal
@@ -17,13 +17,13 @@ import com.typesafe.config.ConfigFactory
 
 object ManyActorsLoadSpec {
   val config = ConfigFactory.parseString(s"""
-      cassandra-journal.keyspace=ManyActorsLoadSpec
-      cassandra-journal.events-by-tag.enabled = on
+      akka.persistence.cassandra.journal.keyspace=ManyActorsLoadSpec
+      akka.persistence.cassandra.events-by-tag.enabled = on
+      akka.persistence.cassandra.journal.support-all-persistence-ids = off
       # increase this to 3s when benchmarking
-      cassandra-journal.events-by-tag.scanning-flush-interval = 1s
-      #cassandra-journal.log-queries = on
-      cassandra-snapshot-store.keyspace=ManyActorsLoadSpecSnapshot
-      #cassandra-snapshot-store.log-queries = on
+      akka.persistence.cassandra.events-by-tag.scanning-flush-interval = 1s
+      #akka.persistence.cassandra.log-queries = on
+      akka.persistence.cassandra.snapshot.keyspace=ManyActorsLoadSpecSnapshot
     """).withFallback(CassandraLifecycle.config)
 
   final case class Init(numberOfEvents: Int)
@@ -76,7 +76,7 @@ class ManyActorsLoadSpec extends CassandraSpec(ManyActorsLoadSpec.config) {
       val rounds = 1 // increase this to 10 when benchmarking
       val deadline =
         Deadline.now + rounds * system.settings.config
-          .getDuration("cassandra-journal.events-by-tag.scanning-flush-interval", TimeUnit.MILLISECONDS)
+          .getDuration("akka.persistence.cassandra.events-by-tag.scanning-flush-interval", TimeUnit.MILLISECONDS)
           .millis + 2.seconds
 
       val tagging: Long => Set[String] = { _ =>

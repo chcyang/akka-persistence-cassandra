@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra
@@ -8,17 +8,28 @@ import java.time.format.DateTimeFormatter
 import java.time.{ LocalDateTime, ZoneId, ZoneOffset }
 import java.util.UUID
 
-import com.datastax.driver.core.utils.UUIDs
+import akka.annotation.InternalApi
+import com.datastax.oss.driver.api.core.cql.AsyncResultSet
+import com.datastax.oss.driver.api.core.uuid.Uuids
 
 package object query {
 
-  val firstBucketFormat = "yyyyMMdd'T'HH:mm"
-  val firstBucketFormatter: DateTimeFormatter =
+  /** INTERNAL API */
+  @InternalApi private[akka] val firstBucketFormat = "yyyyMMdd'T'HH:mm"
+
+  /** INTERNAL API */
+  @InternalApi private[akka] val firstBucketFormatter: DateTimeFormatter =
     DateTimeFormatter.ofPattern(firstBucketFormat).withZone(ZoneOffset.UTC)
 
-  def uuid(timestamp: Long): UUID = {
+  /** INTERNAL API */
+  @InternalApi private[akka] def isExhausted(rs: AsyncResultSet): Boolean = {
+    rs.remaining() == 0 && !rs.hasMorePages
+  }
+
+  /** INTERNAL API */
+  @InternalApi private[akka] def uuid(timestamp: Long): UUID = {
     def makeMsb(time: Long): Long = {
-      // copied from UUIDs.makeMsb
+      // copied from Uuids.makeMsb
       // UUID v1 timestamp must be in 100-nanoseconds interval since 00:00:00.000 15 Oct 1582.
       val uuidEpoch = LocalDateTime.of(1582, 10, 15, 0, 0).atZone(ZoneId.of("GMT-0")).toInstant.toEpochMilli
       val timestamp = (time - uuidEpoch) * 10000
@@ -31,7 +42,7 @@ package object query {
       msb
     }
 
-    val now = UUIDs.timeBased()
+    val now = Uuids.timeBased()
     new UUID(makeMsb(timestamp), now.getLeastSignificantBits)
   }
 }

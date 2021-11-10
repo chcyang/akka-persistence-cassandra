@@ -1,14 +1,14 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.query.scaladsl
 
-import akka.cassandra.session.CassandraMetricsRegistry
 import akka.persistence.cassandra.query.TestActor
 import akka.persistence.cassandra.{ CassandraLifecycle, CassandraSpec }
 import akka.persistence.journal.{ Tagged, WriteEventAdapter }
 import akka.persistence.query.NoOffset
+import akka.stream.alpakka.cassandra.CassandraMetricsRegistry
 import akka.stream.testkit.scaladsl.TestSink
 import com.typesafe.config.ConfigFactory
 
@@ -17,15 +17,15 @@ import scala.concurrent.duration._
 object CassandraReadJournalSpec {
   val config = ConfigFactory.parseString(s"""
     akka.actor.serialize-messages=off
-    cassandra-query-journal.max-buffer-size = 10
-    cassandra-query-journal.refresh-interval = 0.5s
-    cassandra-journal.event-adapters {
+    akka.persistence.cassandra.query.max-buffer-size = 10
+    akka.persistence.cassandra.query.refresh-interval = 0.5s
+    akka.persistence.cassandra.journal.event-adapters {
       test-tagger = akka.persistence.cassandra.query.scaladsl.TestTagger
     }
-    cassandra-journal.event-adapter-bindings = {
+    akka.persistence.cassandra.journal.event-adapter-bindings = {
       "java.lang.String" = test-tagger
     }
-    cassandra-journal.log-queries = off
+    akka.persistence.cassandra.log-queries = off
     """).withFallback(CassandraLifecycle.config)
 }
 
@@ -80,7 +80,7 @@ class CassandraReadJournalSpec extends CassandraSpec(CassandraReadJournalSpec.co
     "insert Cassandra metrics to Cassandra Metrics Registry" in {
       val registry = CassandraMetricsRegistry(system).getRegistry
       val snapshots =
-        registry.getNames.toArray().filter(value => value.toString.startsWith(s"${CassandraReadJournal.Identifier}"))
+        registry.getNames.toArray().filter(value => value.toString.startsWith("akka.persistence.cassandra"))
       snapshots.length should be > 0
     }
   }

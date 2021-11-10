@@ -1,21 +1,26 @@
 # Query Plugin
 
-It implements the following @extref:[Persistence Queries](akka:scala/persistence-query.html):
+It implements the following @extref:[Persistence Queries](akka:persistence-query.html):
 
-* persistenceIds, currentPersistenceIds
 * eventsByPersistenceId, currentEventsByPersistenceId
 * eventsByTag, currentEventsByTag
+* persistenceIds, currentPersistenceIds 
+
+See API details in @apidoc[CassandraReadJournal] and @ref:[eventsByTag documentation](events-by-tag.md). 
 
 Persistence Query usage example to obtain a stream with all events tagged with "someTag" with Persistence Query:
 
     val queries = PersistenceQuery(system).readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
     queries.eventsByTag("someTag", Offset.noOffset)
     
-## Cleanup of tag_views table
+## Configuration
 
-By default the tag_views table keeps tagged events indefinitely, even when the original events have been removed. 
-Depending on the volume of events this may not be suitable for production.
+The default settings can be changed with the configuration properties defined in
+@ref:[reference.conf](configuration.md#default-configuration).
 
-Before going live decide a time to live (TTL) and, if small enough, consider using the [Time Window Compaction Strategy](http://thelastpickle.com/blog/2016/12/08/TWCS-part1.html).
-See `events-by-tag.time-to-live` in reference.conf for how to set this.
+Query configuration is under `akka.persistence.cassandra.query`.
 
+Events by tag configuration is under `akka.persistence.cassandra.events-by-tag` and shared
+by `journal` and `query`.
+
+If using events by tag query it is important to set the @ref:[first time bucket](events-by-tag.md#first-time-bucket)

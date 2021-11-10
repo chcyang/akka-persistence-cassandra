@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2017 Lightbend Inc. <https://www.lightbend.com>
+ * Copyright (C) 2016-2020 Lightbend Inc. <https://www.lightbend.com>
  */
 
 package akka.persistence.cassandra.snapshot
@@ -8,85 +8,71 @@ import java.lang.{ Long => JLong }
 import java.nio.ByteBuffer
 import java.util.NoSuchElementException
 
+import akka.NotUsed
+
 import scala.collection.immutable
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.util.Failure
 import scala.util.Success
 import scala.util.control.NonFatal
-
 import akka.actor._
+import akka.pattern.pipe
 import akka.persistence._
 import akka.persistence.cassandra._
-import akka.persistence.cassandra.journal.FixedRetryPolicy
-import akka.cassandra.session.scaladsl.CassandraSession
 import akka.persistence.serialization.Snapshot
 import akka.persistence.snapshot.SnapshotStore
-import akka.cassandra.session._
 import akka.serialization.AsyncSerializer
 import akka.serialization.Serialization
 import akka.serialization.SerializationExtension
 import akka.serialization.Serializers
-import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.Sink
-import akka.util.OptionVal
-import com.datastax.driver.core._
-import com.datastax.driver.core.policies.LoggingRetryPolicy
-import com.datastax.driver.core.utils.Bytes
+import akka.stream.scaladsl.Source
+import akka.util.{ unused, OptionVal }
+import com.datastax.oss.driver.api.core.cql._
+import com.datastax.oss.protocol.internal.util.Bytes
 import com.typesafe.config.Config
+import akka.Done
+import akka.annotation.InternalApi
+import akka.dispatch.ExecutionContexts
+import akka.event.Logging
+import akka.stream.alpakka.cassandra.scaladsl.{ CassandraSession, CassandraSessionRegistry }
 
-class CassandraSnapshotStore(cfg: Config)
+/**
+ * INTERNAL API
+ */
+@InternalApi private[akka] class CassandraSnapshotStore(@unused cfg: Config, cfgPath: String)
     extends SnapshotStore
-    with CassandraStatements
-    with ActorLogging
-    with CassandraSnapshotCleanup {
+    with ActorLogging {
 
   import CassandraSnapshotStore._
-
-  val snapshotConfig = new CassandraSnapshotStoreConfig(context.system, cfg)
-  val serialization = SerializationExtension(context.system)
-  val snapshotDeserializer = new SnapshotDeserializer(context.system)
   implicit val ec: ExecutionContext = context.dispatcher
+  implicit val sys: ActorSystem = context.system
 
-  import snapshotConfig._
+  // shared config is one level above the journal specific
+  private val sharedConfigPath = cfgPath.replaceAll("""\.snapshot""", "")
+  private val sharedConfig = context.system.settings.config.getConfig(sharedConfigPath)
+  private val settings = new PluginSettings(context.system, sharedConfig)
+  private val snapshotSettings = settings.snapshotSettings
+  private val serialization = SerializationExtension(context.system)
+  private val snapshotSerialization = new SnapshotSerialization(context.system)
+  private val statements = new CassandraStatements(settings)
+  import statements.snapshotStatements._
 
-  private val someMaxLoadAttempts = Some(snapshotConfig.maxLoadAttempts)
-
-  val session = new CassandraSession(
-    context.system,
-    snapshotConfig.sessionProvider,
-    snapshotConfig.sessionSettings,
-    context.dispatcher,
-    log,
-    metricsCategory = s"${self.path.name}",
-    init = session => executeCreateKeyspaceAndTables(session, snapshotConfig))
-
-  private val writeRetryPolicy = new LoggingRetryPolicy(new FixedRetryPolicy(snapshotConfig.writeRetries))
-  private val readRetryPolicy = new LoggingRetryPolicy(new FixedRetryPolicy(snapshotConfig.readRetries))
+  private val someMaxLoadAttempts = Some(snapshotSettings.maxLoadAttempts)
+  private val session: CassandraSession = CassandraSessionRegistry(context.system)
+    .sessionFor(sharedConfigPath, ses => statements.executeAllCreateKeyspaceAndTables(ses, log))
 
   private def preparedWriteSnapshot =
-    session
-      .prepare(writeSnapshot(withMeta = false))
-      .map(_.setConsistencyLevel(writeConsistency).setIdempotent(true).setRetryPolicy(writeRetryPolicy))
+    session.prepare(writeSnapshot(withMeta = false))
   private def preparedWriteSnapshotWithMeta =
-    session
-      .prepare(writeSnapshot(withMeta = true))
-      .map(_.setConsistencyLevel(writeConsistency).setIdempotent(true).setRetryPolicy(writeRetryPolicy))
-
+    session.prepare(writeSnapshot(withMeta = true))
   private def preparedSelectSnapshot =
-    session
-      .prepare(selectSnapshot)
-      .map(_.setConsistencyLevel(readConsistency).setIdempotent(true).setRetryPolicy(readRetryPolicy))
+    session.prepare(selectSnapshot)
   private def preparedSelectSnapshotMetadata: Future[PreparedStatement] =
-    session
-      .prepare(selectSnapshotMetadata(limit = None))
-      .map(_.setConsistencyLevel(readConsistency).setIdempotent(true).setRetryPolicy(readRetryPolicy))
+    session.prepare(selectSnapshotMetadata(limit = None))
   private def preparedSelectSnapshotMetadataWithMaxLoadAttemptsLimit: Future[PreparedStatement] =
-    session
-      .prepare(selectSnapshotMetadata(limit = Some(maxLoadAttempts)))
-      .map(_.setConsistencyLevel(readConsistency).setIdempotent(true).setRetryPolicy(readRetryPolicy))
-
-  private implicit val materializer = ActorMaterializer()
+    session.prepare(selectSnapshotMetadata(limit = Some(snapshotSettings.maxLoadAttempts)))
 
   override def preStart(): Unit =
     // eager initialization, but not from constructor
@@ -94,23 +80,30 @@ class CassandraSnapshotStore(cfg: Config)
 
   override def receivePluginInternal: Receive = {
     case CassandraSnapshotStore.Init =>
+      log.debug("Initializing")
       // try initialize early, to be prepared for first real request
       preparedWriteSnapshot
       preparedWriteSnapshotWithMeta
       preparedDeleteSnapshot
-      preparedDeleteAllSnapshotsForPid
-      if (!snapshotConfig.cassandra2xCompat) preparedDeleteAllSnapshotsForPidAndSequenceNrBetween
+      session.serverMetaData.foreach { meta =>
+        if (!meta.isVersion2)
+          preparedDeleteAllSnapshotsForPidAndSequenceNrBetween
+      }
       preparedSelectSnapshot
       preparedSelectSnapshotMetadata
       preparedSelectSnapshotMetadataWithMaxLoadAttemptsLimit
-  }
+      log.debug("Initialized")
 
-  override def postStop(): Unit =
-    session.close()
+    case DeleteAllSnapshots(persistenceId) =>
+      val result: Future[Done] =
+        deleteAsync(persistenceId, SnapshotSelectionCriteria(maxSequenceNr = Long.MaxValue)).map(_ => Done)
+      result.pipeTo(sender())
+  }
 
   override def loadAsync(
       persistenceId: String,
       criteria: SnapshotSelectionCriteria): Future[Option[SelectedSnapshot]] = {
+    log.debug("loadAsync [{}] [{}]", persistenceId, criteria)
     // The normal case is that timestamp is not specified (Long.MaxValue) in the criteria and then we can
     // use a select stmt with LIMIT if maxLoadAttempts, otherwise the result is iterated and
     // non-matching timestamps are discarded.
@@ -118,6 +111,7 @@ class CassandraSnapshotStore(cfg: Config)
       if (criteria.maxTimestamp == Long.MaxValue)
         preparedSelectSnapshotMetadataWithMaxLoadAttemptsLimit
       else preparedSelectSnapshotMetadata
+
     for {
       p <- snapshotMetaPs
       mds <- metadata(p, persistenceId, criteria, someMaxLoadAttempts)
@@ -130,7 +124,10 @@ class CassandraSnapshotStore(cfg: Config)
     case md +: mds =>
       load1Async(md)
         .map {
-          case Snapshot(s) => Some(SelectedSnapshot(md, s))
+          case DeserializedSnapshot(payload, OptionVal.Some(snapshotMeta)) =>
+            Some(SelectedSnapshot(md.withMetadata(snapshotMeta), payload))
+          case DeserializedSnapshot(payload, OptionVal.None) =>
+            Some(SelectedSnapshot(md, payload))
         }
         .recoverWith {
           case _: NoSuchElementException if metadata.size == 1 =>
@@ -142,16 +139,16 @@ class CassandraSnapshotStore(cfg: Config)
             if (mds.isEmpty) {
               log.warning(
                 s"Failed to load snapshot [$md] ({} of {}), last attempt. Caused by: [{}: {}]",
-                maxLoadAttempts,
-                maxLoadAttempts,
+                snapshotSettings.maxLoadAttempts,
+                snapshotSettings.maxLoadAttempts,
                 e.getClass.getName,
                 e.getMessage)
               Future.failed(e) // all attempts failed
             } else {
               log.warning(
                 s"Failed to load snapshot [$md] ({} of {}), trying older one. Caused by: [{}: {}]",
-                maxLoadAttempts - mds.size,
-                maxLoadAttempts,
+                snapshotSettings.maxLoadAttempts - mds.size,
+                snapshotSettings.maxLoadAttempts,
                 e.getClass.getName,
                 e.getMessage)
               loadNAsync(mds) // try older snapshot
@@ -159,8 +156,9 @@ class CassandraSnapshotStore(cfg: Config)
         }
   }
 
-  private def load1Async(metadata: SnapshotMetadata): Future[Snapshot] = {
-    val boundSelectSnapshot = preparedSelectSnapshot.map(_.bind(metadata.persistenceId, metadata.sequenceNr: JLong))
+  private def load1Async(metadata: SnapshotMetadata): Future[DeserializedSnapshot] = {
+    val boundSelectSnapshot = preparedSelectSnapshot.map(
+      _.bind(metadata.persistenceId, metadata.sequenceNr: JLong).setExecutionProfileName(snapshotSettings.readProfile))
     boundSelectSnapshot.flatMap(session.selectOne).flatMap {
       case None =>
         // Can happen since metadata and the actual snapshot might not be replicated at exactly same time.
@@ -169,18 +167,19 @@ class CassandraSnapshotStore(cfg: Config)
           s"No snapshot for persistenceId [${metadata.persistenceId}] " +
           s"with with sequenceNr [${metadata.sequenceNr}]")
       case Some(row) =>
-        row.getBytes("snapshot") match {
+        row.getByteBuffer("snapshot") match {
           case null =>
-            snapshotDeserializer.deserializeSnapshot(row).map(Snapshot.apply)
+            snapshotSerialization.deserializeSnapshot(row)
           case bytes =>
             // for backwards compatibility
-            Future.successful(serialization.deserialize(Bytes.getArray(bytes), classOf[Snapshot]).get)
+            val payload = serialization.deserialize(Bytes.getArray(bytes), classOf[Snapshot]).get.data
+            Future.successful(DeserializedSnapshot(payload, OptionVal.None))
         }
     }
   }
 
   override def saveAsync(metadata: SnapshotMetadata, snapshot: Any): Future[Unit] =
-    serialize(snapshot).flatMap { ser =>
+    snapshotSerialization.serialize(snapshot, metadata.metadata).flatMap { ser =>
       // using two separate statements with or without the meta data columns because
       // then users doesn't have to alter table and add the new columns if they don't use
       // the meta data feature
@@ -189,24 +188,8 @@ class CassandraSnapshotStore(cfg: Config)
         else preparedWriteSnapshot
 
       stmt.flatMap { ps =>
-        val bs = ps.bind()
-        bs.setString("persistence_id", metadata.persistenceId)
-        bs.setLong("sequence_nr", metadata.sequenceNr)
-        bs.setLong("timestamp", metadata.timestamp)
-        bs.setInt("ser_id", ser.serId)
-        bs.setString("ser_manifest", ser.serManifest)
-        bs.setBytes("snapshot_data", ser.serialized)
-
-        // meta data, if any
-        ser.meta match {
-          case Some(meta) =>
-            bs.setInt("meta_ser_id", meta.serId)
-            bs.setString("meta_ser_manifest", meta.serManifest)
-            bs.setBytes("meta", meta.serialized)
-          case None =>
-        }
-
-        session.executeWrite(bs).map(_ => ())
+        val bound = CassandraSnapshotStore.prepareSnapshotWrite(ps, metadata, ser)
+        session.executeWrite(bound.setExecutionProfileName(snapshotSettings.writeProfile)).map(_ => ())
       }
     }
 
@@ -219,87 +202,61 @@ class CassandraSnapshotStore(cfg: Config)
    * range deletion on the sequence number is used instead, except if timestamp constraints are specified, which still
    * requires the original two step routine.*/
   override def deleteAsync(persistenceId: String, criteria: SnapshotSelectionCriteria): Future[Unit] = {
-    if (snapshotConfig.cassandra2xCompat
-        || 0L < criteria.minTimestamp
-        || criteria.maxTimestamp < SnapshotSelectionCriteria.latest().maxTimestamp) {
-      preparedSelectSnapshotMetadata.flatMap { snapshotMetaPs =>
-        // this meta query gets slower than slower if snapshots are deleted without a criteria.minSequenceNr as
-        // all previous tombstones are scanned in the meta data query
-        metadata(snapshotMetaPs, persistenceId, criteria, limit = None).flatMap {
-          mds: immutable.Seq[SnapshotMetadata] =>
-            val boundStatementBatches = mds
-              .map(md => preparedDeleteSnapshot.map(_.bind(md.persistenceId, md.sequenceNr: JLong)))
-              .grouped(0xFFFF - 1)
-            if (boundStatementBatches.nonEmpty) {
-              Future
-                .sequence(boundStatementBatches.map(boundStatements =>
-                  Future.sequence(boundStatements).flatMap(stmts => executeBatch(batch => stmts.foreach(batch.add)))))
-                .map(_ => ())
-            } else {
-              Future.successful(())
-            }
+    session.serverMetaData.flatMap { meta =>
+      if (meta.isVersion2
+          || settings.cosmosDb
+          || 0L < criteria.minTimestamp
+          || criteria.maxTimestamp < SnapshotSelectionCriteria.latest().maxTimestamp) {
+        preparedSelectSnapshotMetadata.flatMap { snapshotMetaPs =>
+          // this meta query gets slower than slower if snapshots are deleted without a criteria.minSequenceNr as
+          // all previous tombstones are scanned in the meta data query
+          metadata(snapshotMetaPs, persistenceId, criteria, limit = None).flatMap {
+            mds: immutable.Seq[SnapshotMetadata] =>
+              val boundStatementBatches = mds
+                .map(md =>
+                  preparedDeleteSnapshot.map(_.bind(md.persistenceId, md.sequenceNr: JLong)
+                    .setExecutionProfileName(snapshotSettings.writeProfile)))
+                .grouped(0xFFFF - 1)
+              if (boundStatementBatches.nonEmpty) {
+                Future
+                  .sequence(
+                    boundStatementBatches.map(boundStatements =>
+                      Future
+                        .sequence(boundStatements)
+                        .flatMap(stmts => executeBatch(batch => stmts.foreach(batch.addStatement)))))
+                  .map(_ => ())
+              } else {
+                FutureUnit
+              }
+          }
         }
+      } else {
+        val boundDeleteSnapshot = preparedDeleteAllSnapshotsForPidAndSequenceNrBetween.map(
+          _.bind(persistenceId, criteria.minSequenceNr: JLong, criteria.maxSequenceNr: JLong)
+            .setExecutionProfileName(snapshotSettings.writeProfile))
+        boundDeleteSnapshot.flatMap(session.executeWrite(_)).map(_ => ())
       }
-    } else {
-      val boundDeleteSnapshot = preparedDeleteAllSnapshotsForPidAndSequenceNrBetween.map(
-        _.bind(persistenceId, criteria.minSequenceNr: JLong, criteria.maxSequenceNr: JLong))
-      boundDeleteSnapshot.flatMap(session.executeWrite(_)).map(_ => ())
     }
   }
 
-  def executeBatch(body: BatchStatement => Unit): Future[Unit] = {
-    val batch = new BatchStatement().setConsistencyLevel(writeConsistency).asInstanceOf[BatchStatement]
+  def executeBatch(body: BatchStatementBuilder => Unit): Future[Unit] = {
+    import scala.compat.java8.FutureConverters._
+    val batch =
+      new BatchStatementBuilder(BatchType.UNLOGGED).setExecutionProfileName(snapshotSettings.writeProfile)
     body(batch)
-    session.underlying().flatMap(_.executeAsync(batch).asScala).map(_ => ())
+    session.underlying().flatMap(_.executeAsync(batch.build()).toScala).map(_ => ())
   }
-
-  private def serialize(payload: Any): Future[Serialized] =
-    try {
-      def serializeMeta(): Option[SerializedMeta] =
-        // meta data, if any
-        payload match {
-          case SnapshotWithMetaData(_, m) =>
-            val m2 = m.asInstanceOf[AnyRef]
-            val serializer = serialization.findSerializerFor(m2)
-            val serManifest = Serializers.manifestFor(serializer, m2)
-            val metaBuf = ByteBuffer.wrap(serialization.serialize(m2).get)
-            Some(SerializedMeta(metaBuf, serManifest, serializer.identifier))
-          case evt => None
-        }
-
-      val p: AnyRef = (payload match {
-        case SnapshotWithMetaData(snap, _) => snap // unwrap
-        case snap                          => snap
-      }).asInstanceOf[AnyRef]
-      val serializer = serialization.findSerializerFor(p)
-      val serManifest = Serializers.manifestFor(serializer, p)
-      serializer match {
-        case asyncSer: AsyncSerializer =>
-          Serialization.withTransportInformation(context.system.asInstanceOf[ExtendedActorSystem]) { () =>
-            asyncSer.toBinaryAsync(p).map { bytes =>
-              val serPayload = ByteBuffer.wrap(bytes)
-              Serialized(serPayload, serManifest, serializer.identifier, serializeMeta())
-            }
-          }
-        case _ =>
-          Future {
-            // Serialization.serialize adds transport info
-            val serPayload = ByteBuffer.wrap(serialization.serialize(p).get)
-            Serialized(serPayload, serManifest, serializer.identifier, serializeMeta())
-          }
-      }
-
-    } catch {
-      case NonFatal(e) => Future.failed(e)
-    }
 
   private def metadata(
       snapshotMetaPs: PreparedStatement,
       persistenceId: String,
       criteria: SnapshotSelectionCriteria,
       limit: Option[Int]): Future[immutable.Seq[SnapshotMetadata]] = {
-    val boundStmt = snapshotMetaPs.bind(persistenceId, criteria.maxSequenceNr: JLong, criteria.minSequenceNr: JLong)
-    val source = session
+    val boundStmt = snapshotMetaPs
+      .bind(persistenceId, criteria.maxSequenceNr: JLong, criteria.minSequenceNr: JLong)
+      .setExecutionProfileName(snapshotSettings.readProfile)
+    log.debug("Executing metadata query")
+    val source: Source[SnapshotMetadata, NotUsed] = session
       .select(boundStmt)
       .map(row =>
         SnapshotMetadata(row.getString("persistence_id"), row.getLong("sequence_nr"), row.getLong("timestamp")))
@@ -311,16 +268,42 @@ class CassandraSnapshotStore(cfg: Config)
     }
   }
 
+  def preparedDeleteSnapshot: Future[PreparedStatement] =
+    session.prepare(deleteSnapshot)
+
+  def preparedDeleteAllSnapshotsForPidAndSequenceNrBetween: Future[PreparedStatement] =
+    session.prepare(deleteAllSnapshotForPersistenceIdAndSequenceNrBetween)
+
+  def deleteAsync(metadata: SnapshotMetadata): Future[Unit] = {
+    val boundDeleteSnapshot = preparedDeleteSnapshot.map(
+      _.bind(metadata.persistenceId, metadata.sequenceNr: JLong).setExecutionProfileName(snapshotSettings.writeProfile))
+    boundDeleteSnapshot.flatMap(session.executeWrite(_)).map(_ => ())
+  }
+
 }
 
-private[snapshot] object CassandraSnapshotStore {
+/**
+ * INTERNAL API
+ */
+@InternalApi private[akka] object CassandraSnapshotStore {
   private case object Init
 
-  private case class Serialized(serialized: ByteBuffer, serManifest: String, serId: Int, meta: Option[SerializedMeta])
+  sealed trait CleanupCommand
+  final case class DeleteAllSnapshots(persistenceId: String) extends CleanupCommand
 
-  private case class SerializedMeta(serialized: ByteBuffer, serManifest: String, serId: Int)
+  final case class Serialized(serialized: ByteBuffer, serManifest: String, serId: Int, meta: Option[SerializedMeta])
 
-  class SnapshotDeserializer(system: ActorSystem) {
+  final case class SerializedMeta(serialized: ByteBuffer, serManifest: String, serId: Int)
+
+  final case class DeserializedSnapshot(payload: Any, meta: OptionVal[Any])
+
+  /**
+   * INTERNAL API
+   */
+  @InternalApi
+  private[akka] class SnapshotSerialization(system: ActorSystem)(implicit val ec: ExecutionContext) {
+
+    private val log = Logging(system, this.getClass)
 
     private val serialization = SerializationExtension(system)
 
@@ -335,60 +318,116 @@ private[snapshot] object CassandraSnapshotStore {
         b
     }
 
-    def deserializeSnapshot(row: Row)(implicit ec: ExecutionContext): Future[Any] =
+    def serialize(payload: Any, meta: Option[Any]): Future[Serialized] =
       try {
-
-        def meta: OptionVal[AnyRef] =
-          if (hasMetaColumns(row)) {
-            row.getBytes("meta") match {
-              case null =>
-                OptionVal.None // no meta data
-              case metaBytes =>
-                // has meta data, wrap in EventWithMetaData
-                val metaSerId = row.getInt("meta_ser_id")
-                val metaSerManifest = row.getString("meta_ser_manifest")
-                val meta = serialization.deserialize(Bytes.getArray(metaBytes), metaSerId, metaSerManifest) match {
-                  case Success(m) => m
-                  case Failure(_) =>
-                    // don't fail query because of deserialization problem with meta data
-                    // see motivation in UnknownMetaData
-                    SnapshotWithMetaData.UnknownMetaData(metaSerId, metaSerManifest)
-                }
-                OptionVal.Some(meta)
-            }
-          } else {
-            // for backwards compatibility, when table was not altered, meta columns not added
-            OptionVal.None // no meta data
+        def serializeMeta(): Option[SerializedMeta] =
+          meta.map { m =>
+            val m2 = m.asInstanceOf[AnyRef]
+            val serializer = serialization.findSerializerFor(m2)
+            val serManifest = Serializers.manifestFor(serializer, m2)
+            val metaBuf = ByteBuffer.wrap(serialization.serialize(m2).get)
+            SerializedMeta(metaBuf, serManifest, serializer.identifier)
           }
 
-        val bytes = Bytes.getArray(row.getBytes("snapshot_data"))
-        val serId = row.getInt("ser_id")
-        val manifest = row.getString("ser_manifest")
-        serialization.serializerByIdentity.get(serId) match {
-          case Some(asyncSerializer: AsyncSerializer) =>
+        val p: AnyRef = payload.asInstanceOf[AnyRef]
+        val serializer = serialization.findSerializerFor(p)
+        val serManifest = Serializers.manifestFor(serializer, p)
+        serializer match {
+          case asyncSer: AsyncSerializer =>
             Serialization.withTransportInformation(system.asInstanceOf[ExtendedActorSystem]) { () =>
-              asyncSerializer.fromBinaryAsync(bytes, manifest).map { payload =>
-                meta match {
-                  case OptionVal.None    => payload
-                  case OptionVal.Some(m) => SnapshotWithMetaData(payload, m)
-                }
+              asyncSer.toBinaryAsync(p).map { bytes =>
+                val serPayload = ByteBuffer.wrap(bytes)
+                Serialized(serPayload, serManifest, serializer.identifier, serializeMeta())
               }
             }
-
           case _ =>
-            Future.successful {
-              // Serialization.deserialize adds transport info
-              val payload =
-                serialization.deserialize(bytes, serId, manifest).get
-              meta match {
-                case OptionVal.None    => payload
-                case OptionVal.Some(m) => SnapshotWithMetaData(payload, m)
-              }
+            Future {
+              // Serialization.serialize adds transport info
+              val serPayload = ByteBuffer.wrap(serialization.serialize(p).get)
+              Serialized(serPayload, serManifest, serializer.identifier, serializeMeta())
             }
         }
 
       } catch {
         case NonFatal(e) => Future.failed(e)
       }
+
+    def deserializeSnapshot(row: Row): Future[DeserializedSnapshot] =
+      try {
+
+        def meta: OptionVal[AnyRef] =
+          if (hasMetaColumns(row)) {
+            row.getByteBuffer("meta") match {
+              case null =>
+                OptionVal.None // no meta data
+              case metaBytes =>
+                // has meta data, wrap in EventWithMetaData
+                val metaSerId = row.getInt("meta_ser_id")
+                val metaSerManifest = row.getString("meta_ser_manifest")
+                serialization.deserialize(Bytes.getArray(metaBytes), metaSerId, metaSerManifest) match {
+                  case Success(m) => OptionVal.Some(m)
+                  case Failure(ex) =>
+                    log.warning(
+                      "Deserialization of snapshot metadata failed (pid: [{}], seq_nr: [{}], meta_ser_id: [{}], meta_ser_manifest: [{}], ignoring metadata content. Exception: {}",
+                      Array(
+                        row.getString("persistence_id"),
+                        row.getLong("sequence_nr"),
+                        metaSerId,
+                        metaSerManifest,
+                        ex.toString))
+                    OptionVal.None
+                }
+            }
+          } else {
+            // for backwards compatibility, when table was not altered, meta columns not added
+            OptionVal.None // no meta data
+          }
+
+        val bytes = Bytes.getArray(row.getByteBuffer("snapshot_data"))
+        val serId = row.getInt("ser_id")
+        val manifest = row.getString("ser_manifest")
+        (serialization.serializerByIdentity.get(serId) match {
+          case Some(asyncSerializer: AsyncSerializer) =>
+            Serialization.withTransportInformation(system.asInstanceOf[ExtendedActorSystem]) { () =>
+              asyncSerializer.fromBinaryAsync(bytes, manifest)
+            }
+
+          case _ =>
+            Future.successful {
+              // Serialization.deserialize adds transport info
+              serialization.deserialize(bytes, serId, manifest).get
+            }
+        }).map(payload => DeserializedSnapshot(payload, meta))(ExecutionContexts.parasitic)
+
+      } catch {
+        case NonFatal(e) => Future.failed(e)
+      }
+  }
+
+  /**
+   * INTERNAL API
+   */
+  private[akka] def prepareSnapshotWrite(
+      ps: PreparedStatement,
+      metadata: SnapshotMetadata,
+      ser: Serialized): BoundStatement = {
+    val bs = ps
+      .bind()
+      .setString("persistence_id", metadata.persistenceId)
+      .setLong("sequence_nr", metadata.sequenceNr)
+      .setLong("timestamp", metadata.timestamp)
+      .setInt("ser_id", ser.serId)
+      .setString("ser_manifest", ser.serManifest)
+      .setByteBuffer("snapshot_data", ser.serialized)
+
+    // meta data, if any
+    ser.meta match {
+      case Some(meta) =>
+        bs.setInt("meta_ser_id", meta.serId)
+          .setString("meta_ser_manifest", meta.serManifest)
+          .setByteBuffer("meta", meta.serialized)
+      case None =>
+        bs
+    }
   }
 }

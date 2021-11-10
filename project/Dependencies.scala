@@ -2,39 +2,65 @@ import sbt._
 import Keys._
 
 object Dependencies {
-  val Scala212 = "2.12.8"
-  val Scala213 = "2.13.0"
+  val Scala212 = "2.12.14"
+  val Scala213 = "2.13.6"
   val ScalaVersions = Seq(Scala212, Scala213)
 
-  val AkkaVersion = System.getProperty("override.akka.version", "2.5.23")
+  val AkkaVersion = System.getProperty("override.akka.version", "2.6.9")
+  val AkkaVersionInDocs = AkkaVersion.take(3)
   val CassandraVersionInDocs = "4.0"
+  // Should be sync with the version of the driver in Alpakka Cassandra
+  val DriverVersionInDocs = "4.6"
 
-  val akkaCassandraSessionDependencies = Seq(
-    "com.datastax.cassandra" % "cassandra-driver-core" % "3.7.2",
-    "com.typesafe.akka" %% "akka-stream" % AkkaVersion,
+  val AlpakkaVersion = "2.0.2"
+  val AlpakkaVersionInDocs = AlpakkaVersion.take(3)
+  // for example
+  val AkkaManagementVersion = "1.0.6"
+
+  val Logback = "ch.qos.logback" % "logback-classic" % "1.2.3"
+
+  val reconcilerDependencies = Seq(
+    "com.typesafe.akka" %% "akka-actor-testkit-typed" % AkkaVersion % Test,
     "com.typesafe.akka" %% "akka-stream-testkit" % AkkaVersion % Test)
 
+  val akkaTestDeps = Seq(
+    "com.typesafe.akka" %% "akka-persistence",
+    "com.typesafe.akka" %% "akka-persistence-typed",
+    "com.typesafe.akka" %% "akka-persistence-query",
+    "com.typesafe.akka" %% "akka-cluster-typed",
+    "com.typesafe.akka" %% "akka-actor-testkit-typed",
+    "com.typesafe.akka" %% "akka-persistence-tck",
+    "com.typesafe.akka" %% "akka-stream-testkit",
+    "com.typesafe.akka" %% "akka-multi-node-testkit",
+    "com.typesafe.akka" %% "akka-cluster-sharding")
+
   val akkaPersistenceCassandraDependencies = Seq(
-    "com.datastax.cassandra" % "cassandra-driver-core" % "3.7.1",
-    // Specifying guava dependency because older transitive dependency has security vulnerability
-    "com.google.guava" % "guava" % "27.0.1-jre",
-    // Specifying jnr-posix version for licensing reasons: cassandra-driver-core
-    // depends on version 3.0.44, but for this version the LICENSE.txt and the
-    // pom.xml have conflicting licensing information. 3.0.45 fixes this and
-    // makes it clear this library is available under (among others) the EPL
-    "com.github.jnr" % "jnr-posix" % "3.0.45",
-    "com.typesafe.akka" %% "akka-persistence" % AkkaVersion,
-    "com.typesafe.akka" %% "akka-cluster-tools" % AkkaVersion,
-    "com.typesafe.akka" %% "akka-persistence-query" % AkkaVersion,
-    "com.typesafe.akka" %% "akka-persistence-typed" % AkkaVersion % Test,
-    "com.typesafe.akka" %% "akka-cluster-typed" % AkkaVersion % Test,
-    "com.typesafe.akka" %% "akka-actor-testkit-typed" % AkkaVersion % Test,
+      "com.lightbend.akka" %% "akka-stream-alpakka-cassandra" % AlpakkaVersion,
+      "com.typesafe.akka" %% "akka-persistence" % AkkaVersion,
+      "com.typesafe.akka" %% "akka-persistence-query" % AkkaVersion,
+      "com.typesafe.akka" %% "akka-cluster-tools" % AkkaVersion,
+      "org.scala-lang.modules" %% "scala-collection-compat" % "2.4.4",
+      Logback % Test,
+      "org.scalatest" %% "scalatest" % "3.1.4" % Test,
+      "org.pegdown" % "pegdown" % "1.6.0" % Test,
+      "org.osgi" % "org.osgi.core" % "5.0.0" % Provided) ++ akkaTestDeps.map(_ % AkkaVersion % Test)
+
+  val exampleDependencies = Seq(
+    Logback,
+    "com.typesafe.akka" %% "akka-persistence-typed" % AkkaVersion,
+    "com.typesafe.akka" %% "akka-discovery" % AkkaVersion,
+    "com.typesafe.akka" %% "akka-serialization-jackson" % AkkaVersion,
+    "com.typesafe.akka" %% "akka-cluster-sharding-typed" % AkkaVersion,
+    "com.lightbend.akka.management" %% "akka-management" % AkkaManagementVersion,
+    "com.lightbend.akka.management" %% "akka-management-cluster-bootstrap" % AkkaManagementVersion,
+    "com.lightbend.akka.management" %% "akka-management-cluster-http" % AkkaManagementVersion,
+    "com.lightbend.akka.discovery" %% "akka-discovery-kubernetes-api" % AkkaManagementVersion,
+    "org.hdrhistogram" % "HdrHistogram" % "2.1.12")
+
+  val dseTestDependencies = Seq(
+    "com.datastax.dse" % "dse-java-driver-core" % "2.3.0" % Test,
     "com.typesafe.akka" %% "akka-persistence-tck" % AkkaVersion % Test,
+    "com.typesafe.akka" %% "akka-actor-testkit-typed" % AkkaVersion % Test,
     "com.typesafe.akka" %% "akka-stream-testkit" % AkkaVersion % Test,
-    "com.typesafe.akka" %% "akka-multi-node-testkit" % AkkaVersion % Test,
-    "com.typesafe.akka" %% "akka-cluster-sharding" % AkkaVersion % Test,
-    "ch.qos.logback" % "logback-classic" % "1.2.3" % Test,
-    "org.scalatest" %% "scalatest" % "3.0.8-RC2" % Test,
-    "org.pegdown" % "pegdown" % "1.6.0" % Test,
-    "org.osgi" % "org.osgi.core" % "5.0.0" % Provided)
+    Logback % Test)
 }
