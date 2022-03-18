@@ -3,7 +3,8 @@ import Keys._
 
 object Dependencies {
   val Scala212 = "2.12.14"
-  val Scala213 = "2.13.6"
+  // update even in check-build-test.yml
+  val Scala213 = "2.13.8"
   val ScalaVersions = Seq(Scala212, Scala213)
 
   val AkkaVersion = System.getProperty("override.akka.version", "2.6.9")
@@ -17,7 +18,7 @@ object Dependencies {
   // for example
   val AkkaManagementVersion = "1.0.6"
 
-  val Logback = "ch.qos.logback" % "logback-classic" % "1.2.3"
+  val Logback = "ch.qos.logback" % "logback-classic" % "1.2.10"
 
   val reconcilerDependencies = Seq(
     "com.typesafe.akka" %% "akka-actor-testkit-typed" % AkkaVersion % Test,
@@ -41,7 +42,7 @@ object Dependencies {
       "com.typesafe.akka" %% "akka-cluster-tools" % AkkaVersion,
       "org.scala-lang.modules" %% "scala-collection-compat" % "2.4.4",
       Logback % Test,
-      "org.scalatest" %% "scalatest" % "3.1.4" % Test,
+      "org.scalatest" %% "scalatest" % "3.2.11" % Test,
       "org.pegdown" % "pegdown" % "1.6.0" % Test,
       "org.osgi" % "org.osgi.core" % "5.0.0" % Provided) ++ akkaTestDeps.map(_ % AkkaVersion % Test)
 
